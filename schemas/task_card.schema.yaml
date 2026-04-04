@@ -1,0 +1,16 @@
+# Schema for task cards — the structured input each agent receives
+required_fields:
+  - task_id
+  - role
+  - stage
+  - instruction
+
+field_types:
+  task_id: string
+  role: string
+  stage: string
+  instruction: string
+  context_files: list
+  required_outputs: list
+  previous_feedback: string
+  constraints: list

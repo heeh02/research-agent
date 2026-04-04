@@ -1,0 +1,32 @@
+# Problem Brief Template
+# Fill this in to define your research problem
+
+domain: ""                          # e.g., "Natural Language Processing"
+problem_statement: ""               # One clear sentence
+motivation: ""                      # Why does this matter?
+scope: ""                           # What's in/out of scope
+
+existing_approaches:
+  - name: ""
+    description: ""
+    key_paper: ""
+  - name: ""
+    description: ""
+    key_paper: ""
+  - name: ""
+    description: ""
+    key_paper: ""
+
+limitations_of_existing:
+  - ""
+  - ""
+
+proposed_direction: ""              # High-level approach
+success_criteria: ""                # How do we know we succeeded?
+
+key_references:
+  - title: ""
+    authors: ""
+    year: 2024
+    relevance: ""
+  # Add at least 5 references

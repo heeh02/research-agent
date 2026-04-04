@@ -1,0 +1,33 @@
+# Hypothesis Card Template
+# The core deliverable of the hypothesis formation stage
+
+claim: ""                           # The hypothesis in one sentence
+motivation: ""                      # Why we believe this might be true
+why_now: ""                         # What changed that makes this timely?
+novelty_argument: ""                # How is this different from prior work?
+
+key_assumptions:
+  - ""
+  - ""
+
+testable_predictions:
+  - ""                              # "If hypothesis is true, then X"
+  - ""
+
+baseline_comparison: ""             # What we're comparing against
+expected_improvement: ""            # Quantitative if possible
+
+key_risks:
+  - risk: ""
+    likelihood: "medium"            # low / medium / high
+    mitigation: ""
+  - risk: ""
+    likelihood: ""
+    mitigation: ""
+
+kill_criteria:                      # When to abandon this direction
+  - ""                              # e.g., "If accuracy < baseline after 3 runs"
+  - ""
+
+minimum_viable_experiment: ""       # Simplest experiment to test the core claim
+estimated_compute_budget: ""        # e.g., "8 GPU-hours on A100"

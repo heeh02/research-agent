@@ -1,0 +1,57 @@
+domain: "Vision-Language-Action Models for Robotic Manipulation"
+problem_statement: "How to design novel Vision-Language-Action (VLA) model architectures that achieve significant performance improvements in robotic manipulation tasks while addressing current limitations in cross-embodiment generalization, computational efficiency, and long-horizon reasoning capabilities?"
+motivation: "Current VLA models show promising results but suffer from prohibitive computational demands, limited cross-robot generalization, and fragile performance on long-horizon tasks. Recent advances in 2025 (π0, Helix, GR00T N1) demonstrate the potential for architectural innovations, yet fundamental challenges remain unsolved. A breakthrough in VLA architecture could enable truly general-purpose robotic systems and represents a critical research direction for top-tier venues."
+scope: "Focus on novel architectural innovations for VLA models including: (1) efficient multimodal fusion mechanisms, (2) cross-embodiment generalization architectures, (3) hierarchical action representation learning, (4) compute-efficient training and inference strategies, and (5) long-horizon reasoning capabilities. Target evaluation on standard benchmarks (CALVIN, RLBench, VLABench) and real-world robotic platforms."
+existing_approaches:
+  - name: "Transformer-based VLA with Cross-Modal Attention (RT-2)"
+    description: "Uses vision transformers with cross-modal attention mechanisms to fuse visual, language, and action modalities. Employs pre-trained language models as backbones with learned action tokenization."
+    key_paper: "Brohan et al., RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control, CoRL 2023"
+  - name: "Diffusion-based Action Generation (Octo, π0)"
+    description: "Leverages diffusion models for action sequence generation, enabling more stable and diverse action predictions. Combines pre-trained vision-language models with diffusion decoders for trajectory generation."
+    key_paper: "TeamOCTO, Octo: An Open-Source Generalist Robot Policy, RSS 2024; Physical Intelligence, π0: A Vision-Language-Action Flow Model for General Robot Control, ArXiv 2024"
+  - name: "Dual-System Architecture (GR00T N1, Helix)"
+    description: "Implements complementary subsystems: System 1 for fast diffusion-based low-level control (10ms latency) and System 2 for LLM-based high-level planning and task decomposition."
+    key_paper: "NVIDIA GR00T N1, 2025; Figure AI Helix, Nature Robotics 2025"
+  - name: "Mixture-of-Experts VLA (ForceVLA, ChatVLA)"
+    description: "Incorporates specialized expert modules for different modalities or skills, using adaptive routing mechanisms to reduce computational overhead while improving task-specific performance."
+    key_paper: "ForceVLA: Force-Aware Vision-Language-Action Model, ICLR 2025; ChatVLA: Vision-Language-Action Chatbot, NeurIPS 2024"
+  - name: "Open-Source Foundation Models (OpenVLA)"
+    description: "7B parameter model trained on Open X-Embodiment dataset, demonstrating strong cross-embodiment generalization with transformer-based architecture and action chunking mechanisms."
+    key_paper: "Kim et al., OpenVLA: An Open-Source Vision-Language-Action Model, ICML 2024"
+limitations_of_existing:
+  - "Cross-embodiment generalization remains limited despite recent advances, with most models struggling to transfer learned policies across different robot morphologies and action spaces without significant fine-tuning"
+  - "Computational inefficiency of large-scale VLA models (7B-55B parameters) makes real-time deployment challenging, with current models requiring substantial GPU resources for inference"
+  - "Long-horizon task performance degrades significantly due to error accumulation and limited reasoning capabilities, particularly evident in multi-step manipulation tasks requiring temporal understanding"
+  - "Sim-to-real gap persists across all approaches, with models showing substantial performance drops when deployed on real robots due to domain shifts in lighting, textures, and dynamics"
+  - "Limited interpretability and safety guarantees make VLA models unsuitable for critical applications, with black-box behavior and potential for language hallucination creating reliability concerns"
+proposed_direction: "Develop a novel hierarchical multi-scale VLA architecture that combines efficient local attention mechanisms with global temporal reasoning modules. The approach will integrate: (1) a lightweight visual encoder using sparse attention patterns, (2) a hierarchical action representation with both atomic and composite actions, (3) a temporal reasoning module for long-horizon planning, and (4) cross-embodiment adaptation layers that learn universal action primitives while maintaining embodiment-specific control policies."
+success_criteria: "Achieve >20% improvement over current SOTA (OpenVLA) on VLABench long-horizon tasks, demonstrate successful transfer across 5+ different robot embodiments with <10% performance drop, reduce computational requirements by 50% while maintaining performance parity, achieve >90% task success rate on CALVIN benchmark, and provide interpretable action justifications with verified correlation to actual robot behavior."
+key_references:
+  - title: "OpenVLA: An Open-Source Vision-Language-Action Model"
+    authors: "Kim et al."
+    year: 2024
+    relevance: "Current SOTA open-source VLA model providing baseline for cross-embodiment evaluation"
+  - title: "RT-2: Vision-Language-Action Models Transfer Web Knowledge to Robotic Control"
+    authors: "Brohan et al."
+    year: 2023
+    relevance: "Foundational work establishing transformer-based VLA architecture and web-scale pre-training"
+  - title: "VLABench: A Large-Scale Benchmark for Language-Conditioned Robotics Manipulation with Long-Horizon Reasoning Tasks"
+    authors: "Zhang et al."
+    year: 2024
+    relevance: "Latest comprehensive benchmark for evaluating VLA models on long-horizon reasoning tasks"
+  - title: "10 Open Challenges Steering the Future of Vision-Language-Action Models"
+    authors: "Li et al."
+    year: 2024
+    relevance: "Comprehensive analysis of current limitations and future research directions in VLA"
+  - title: "A Survey on Efficient Vision-Language-Action Models"
+    authors: "Wang et al."
+    year: 2024
+    relevance: "Review of computational efficiency approaches and optimization strategies for VLA models"
+  - title: "Octo: An Open-Source Generalist Robot Policy"
+    authors: "TeamOCTO"
+    year: 2024
+    relevance: "Diffusion-based VLA approach demonstrating effective action sequence generation"
+  - title: "Vision-Language-Action Models: Concepts, Progress, Applications and Challenges"
+    authors: "Chen et al."
+    year: 2024
+    relevance: "Comprehensive survey of VLA model architectures and applications in robotics"

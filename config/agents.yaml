@@ -1,0 +1,79 @@
+# Agent Prompt Contracts
+# =====================
+# This file documents the contract each agent must follow.
+
+researcher:
+  role: "Senior Research Scientist"
+  responsibilities:
+    - Literature analysis and synthesis
+    - Gap identification and trend mapping
+    - Hypothesis formulation
+    - Result analysis and conclusion drawing
+  never_does:
+    - Write production code
+    - Make final judgments on quality (that's the Critic's job)
+    - Design experiments (that's the Engineer's job)
+  produces:
+    - problem_brief (Stage: problem_definition)
+    - literature_map (Stage: literature_review)
+    - evidence_table (Stage: literature_review)
+    - hypothesis_card (Stage: hypothesis_formation)
+    - result_report (Stage: analysis)
+  backend: "Claude API (claude-sonnet-4)"
+  rationale: >
+    Claude excels at synthesis, long-context reading, and structured output.
+    Research tasks require synthesizing many papers and producing structured artifacts.
+
+critic:
+  role: "Adversarial Scientific Reviewer"
+  responsibilities:
+    - Find flaws in reasoning
+    - Challenge assumptions
+    - Verify claims against evidence
+    - Score quality on rubrics
+    - Gate-keep stage transitions
+  never_does:
+    - Produce primary content (only reviews)
+    - Rewrite artifacts (only critiques)
+    - Write code
+  produces:
+    - review_report (All stages)
+  backend: "OpenAI Codex via codex-plugin-cc"
+  interactive_commands:
+    review: "/codex:review --wait"
+    adversarial: "/codex:adversarial-review"
+    rescue: "/codex:rescue"
+    status: "/codex:status"
+    result: "/codex:result"
+  programmatic: "codex exec 'review prompt'"
+  rationale: >
+    Codex provides THREE advantages over raw GPT API calls:
+    1. CODEBASE-AWARE: Codex reads the full project in its sandbox — no context
+       truncation, no manual copy-paste of artifacts.
+    2. ADVERSARIAL BY DESIGN: /codex:adversarial-review is specifically built to
+       challenge design decisions, assumptions, and failure modes.
+    3. TRUE INDEPENDENCE: Different model family (GPT vs Claude) ensures genuine
+       independent review. Same-model review tends to rubber-stamp.
+    Additional benefits: background jobs, review gate auto-blocking, ChatGPT auth
+    (no separate API key), and /codex:rescue for delegating investigations.
+
+engineer:
+  role: "Senior ML Engineer"
+  responsibilities:
+    - Translate hypotheses into experiment specs
+    - Implement experiments in code
+    - Debug failures and iterate
+    - Ensure reproducibility
+  never_does:
+    - Decide research direction (that's the Researcher's job)
+    - Final quality review (that's the Critic's job)
+    - Modify the hypothesis (only implements it)
+  produces:
+    - experiment_spec (Stage: experiment_design)
+    - code (Stage: implementation)
+    - run_manifest (Stage: implementation)
+    - experiment_log (Stage: experimentation)
+  backend: "Claude API (claude-sonnet-4)"
+  rationale: >
+    Claude is strong at code generation, following specifications precisely,
+    and handling complex implementation details.

@@ -1,0 +1,80 @@
+# Research Agent — Global Settings
+# ================================
+
+pipeline:
+  automation_level: hybrid
+  human_gates:
+    - hypothesis_formation
+    - experimentation
+  max_iterations: 5
+
+  # Version-based confirmation in advance/step mode
+  # Before major (stage advance) or minor (revision) version bump:
+  #   advance/step mode → prompt human yes/no, no → input feedback
+  #   auto mode → skip confirmation, fully automatic
+  confirm_before_advance: true   # Only applies to advance/step mode
+
+# Agent configurations
+agents:
+  researcher:
+    provider: claude
+    model: claude-sonnet-4-20250514
+    max_turns: 15
+    allowed_tools: "Read,Write,Glob,Grep,WebSearch,WebFetch"
+
+  critic:
+    provider: codex
+    model: gpt-5.4              # GPT-5.4 for strongest review
+    effort: xhigh               # Maximum reasoning depth
+    description: >
+      Codex process for adversarial review with GPT-5.4 xhigh.
+
+  engineer:
+    provider: claude
+    model: claude-sonnet-4-20250514
+    max_turns: 25
+    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep"
+
+  orchestrator:
+    provider: claude
+    model: claude-sonnet-4-20250514
+    max_turns: 10
+    allowed_tools: "Read,Write,Bash,Glob,Grep"
+
+# Codex plugin configuration
+codex:
+  review_gate:
+    enabled: false
+    stages: [implementation, experimentation]
+  prefer_background: true
+  fallback_to_api: true
+  fallback_model: gpt-5.4
+
+# Cost management
+cost:
+  warning_threshold: 5.0
+  hard_limit: 50.0
+  codex_estimated_cost_per_review: 0.10   # GPT-5.4 xhigh is more expensive
+
+# Experiment tracking
+tracking:
+  enabled: false
+  backend: mlflow
+  mlflow:
+    tracking_uri: "http://localhost:5000"
+    experiment_prefix: "research-agent"
+  wandb:
+    project: "research-agent"
+    entity: null
+
+# GitHub integration
+github:
+  enabled: false
+  repo: null
+  branch_prefix: "exp/"
+  require_pr_review: true
+
+# Web GUI
+gui:
+  host: "127.0.0.1"
+  port: 8080

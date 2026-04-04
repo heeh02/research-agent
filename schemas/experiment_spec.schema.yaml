@@ -1,0 +1,37 @@
+# Schema for experiment_spec artifact
+required_fields:
+  - experiment_name
+  - hypothesis_reference
+  - datasets
+  - models
+  - training
+  - evaluation
+  - ablations
+  - compute_budget
+  - success_criteria
+  - kill_criteria
+  - failure_plan
+  - environment
+  - output_structure
+
+field_types:
+  experiment_name: string
+  hypothesis_reference: string
+  datasets: list
+  models: list
+  training: mapping
+  evaluation: mapping
+  ablations: list
+  compute_budget: mapping
+  success_criteria: list
+  kill_criteria: list
+  failure_plan: list
+  environment: mapping
+  output_structure: mapping
+
+min_lengths:
+  datasets: 1
+  models: 2      # At least one baseline + one proposed
+  ablations: 1
+  success_criteria: 1
+  kill_criteria: 1

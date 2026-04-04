@@ -1,0 +1,45 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os\ntool_input = json.load(open(os.environ.get('CLAUDE_TOOL_INPUT', '/dev/null')))\npath = tool_input.get('file_path', '')\nblocked = ['.env', 'credentials', '.secret', 'api_key', 'token']\nfor b in blocked:\n    if b in path.lower():\n        print(f'BLOCKED: will not write secrets to {path}')\n        sys.exit(1)\n\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os, subprocess\ntool_input = json.load(open(os.environ.get('CLAUDE_TOOL_INPUT', '/dev/null')))\npath = tool_input.get('file_path', '')\nif path.endswith('.py'):\n    result = subprocess.run(['python3', '-m', 'py_compile', path], capture_output=True, text=True)\n    if result.returncode != 0:\n        print(f'SYNTAX ERROR in {path}: {result.stderr}')\n\""
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport sys, json, os\ntool_input = json.load(open(os.environ.get('CLAUDE_TOOL_INPUT', '/dev/null')))\npath = tool_input.get('file_path', '')\nif path.endswith('.yaml') and '/artifacts/' in path:\n    import subprocess\n    result = subprocess.run(\n        ['python3', 'scripts/pipeline.py', 'validate', path],\n        capture_output=True, text=True, cwd=os.environ.get('CLAUDE_PROJECT_DIR', '.')\n    )\n    if result.returncode != 0:\n        print(f'SCHEMA WARNING: {result.stdout}')\n    else:\n        print(result.stdout)\n\""
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport os\nactive = os.path.join(os.environ.get('CLAUDE_PROJECT_DIR', '.'), '.active_project')\nif os.path.exists(active):\n    pid = open(active).read().strip()\n    print(f'[Pipeline] Active project: {pid}')\n    print('Check status: python scripts/pipeline.py status')\n\""
+          }
+        ]
+      }
+    ]
+  }
+}

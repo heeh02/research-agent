@@ -1,0 +1,224 @@
+# Stage Definitions & Gate Criteria
+# ==================================
+
+stages:
+  problem_definition:
+    description: "Define the research problem, scope, and motivation"
+    primary_agent: researcher
+    reviewer: critic
+    required_artifacts:
+      - problem_brief
+    gate_criteria:
+      - name: clarity
+        description: "Problem statement is unambiguous"
+        weight: 0.2
+      - name: significance
+        description: "Addresses a real and important gap"
+        weight: 0.2
+      - name: scope
+        description: "Neither too broad nor too narrow"
+        weight: 0.2
+      - name: novelty
+        description: "Genuinely different from existing work"
+        weight: 0.2
+      - name: feasibility
+        description: "Can be investigated with available resources"
+        weight: 0.2
+    pass_threshold: 0.7
+    human_gate: false
+
+  literature_review:
+    description: "Comprehensive literature analysis and gap identification"
+    primary_agent: researcher
+    reviewer: critic
+    required_artifacts:
+      - literature_map
+      - evidence_table
+    gate_criteria:
+      - name: coverage
+        description: "Key papers included, no major omissions"
+        weight: 0.2
+      - name: recency
+        description: "Includes papers from last 2 years"
+        weight: 0.15
+      - name: balance
+        description: "Conflicting viewpoints represented"
+        weight: 0.15
+      - name: gap_identification
+        description: "Claimed gaps are real and well-supported"
+        weight: 0.3
+      - name: baseline_completeness
+        description: "Appropriate baselines recommended"
+        weight: 0.2
+    pass_threshold: 0.7
+    human_gate: false
+
+  hypothesis_formation:
+    description: "Formulate testable, falsifiable research hypothesis"
+    primary_agent: researcher
+    reviewer: critic
+    required_artifacts:
+      - hypothesis_card
+    gate_criteria:
+      - name: falsifiability
+        description: "Can be disproven by experiment"
+        weight: 0.2
+      - name: novelty
+        description: "Not a minor variation of existing work"
+        weight: 0.15
+      - name: grounding
+        description: "Well-supported by literature"
+        weight: 0.15
+      - name: testability
+        description: "Minimum viable experiment can test this"
+        weight: 0.2
+      - name: risk_awareness
+        description: "Key risks identified and mitigated"
+        weight: 0.15
+      - name: kill_criteria
+        description: "Specific enough to act on"
+        weight: 0.15
+    pass_threshold: 0.7
+    human_gate: true  # Always get human sign-off before committing
+
+  experiment_design:
+    description: "Complete executable experiment specification"
+    primary_agent: engineer
+    reviewer: critic
+    required_artifacts:
+      - experiment_spec
+    gate_criteria:
+      - name: completeness
+        description: "All variables, controls, metrics defined"
+        weight: 0.2
+      - name: reproducibility
+        description: "Someone else could run this from the spec"
+        weight: 0.15
+      - name: statistical_rigor
+        description: "Appropriate tests, sample sizes, confidence levels"
+        weight: 0.15
+      - name: baseline_fairness
+        description: "Baselines given a fair chance"
+        weight: 0.15
+      - name: ablation_coverage
+        description: "Ablations isolate the claimed contribution"
+        weight: 0.15
+      - name: budget_realism
+        description: "Compute/data budget is realistic"
+        weight: 0.1
+      - name: failure_plan
+        description: "Clear plan for when things go wrong"
+        weight: 0.1
+    pass_threshold: 0.7
+    human_gate: false
+
+  implementation:
+    description: "Code implementation of the experiment"
+    primary_agent: engineer
+    reviewer: critic
+    required_artifacts:
+      - code
+      - test_result
+    gate_criteria:
+      - name: correctness
+        description: "Code implements the spec"
+        weight: 0.3
+      - name: reproducibility
+        description: "Seeds, versions, configs fixed"
+        weight: 0.2
+      - name: test_coverage
+        description: "Tests for critical paths"
+        weight: 0.2
+      - name: efficiency
+        description: "No obvious performance issues"
+        weight: 0.15
+      - name: documentation
+        description: "Can understand and run this"
+        weight: 0.15
+    pass_threshold: 0.7
+    human_gate: false
+
+  experimentation:
+    description: "Execute experiments and collect results"
+    primary_agent: engineer
+    reviewer: engineer  # Self-review for debugging
+    required_artifacts:
+      - run_manifest
+      - metrics
+    gate_criteria:
+      - name: execution_complete
+        description: "All planned experiments ran"
+        weight: 0.3
+      - name: metrics_logged
+        description: "All metrics tracked and saved"
+        weight: 0.2
+      - name: reproducibility_check
+        description: "Results reproducible across seeds"
+        weight: 0.2
+      - name: no_anomalies
+        description: "No unexplained anomalies in results"
+        weight: 0.15
+      - name: resource_tracking
+        description: "Compute usage logged"
+        weight: 0.15
+    pass_threshold: 0.7
+    human_gate: true  # Human reviews before expensive compute
+
+  analysis:
+    description: "Analyze results and draw conclusions"
+    primary_agent: researcher
+    reviewer: critic
+    required_artifacts:
+      - result_report
+      - claim_checklist
+    gate_criteria:
+      - name: evidence_support
+        description: "Results support the claims"
+        weight: 0.25
+      - name: statistical_validity
+        description: "Statistics are correct"
+        weight: 0.2
+      - name: alternative_explanations
+        description: "Confounds addressed"
+        weight: 0.2
+      - name: honest_reporting
+        description: "Negative results included"
+        weight: 0.15
+      - name: reproducibility
+        description: "Results reproducible"
+        weight: 0.2
+    pass_threshold: 0.7
+    human_gate: false
+
+# Allowed backward transitions (rollbacks)
+# Each entry: [from_stage, to_stage, trigger]
+rollback_rules:
+  - from: hypothesis_formation
+    to: literature_review
+    trigger: need_more_evidence
+    description: "Hypothesis requires more literature support"
+
+  - from: experiment_design
+    to: hypothesis_formation
+    trigger: hypothesis_needs_revision
+    description: "Experiment reveals hypothesis is poorly formed"
+
+  - from: implementation
+    to: experiment_design
+    trigger: design_flaw_found
+    description: "Implementation reveals spec is incomplete or wrong"
+
+  - from: experimentation
+    to: implementation
+    trigger: code_bug_found
+    description: "Experiment failure due to code bug"
+
+  - from: analysis
+    to: experimentation
+    trigger: need_more_experiments
+    description: "Results inconclusive, need additional experiments"
+
+  - from: analysis
+    to: hypothesis_formation
+    trigger: hypothesis_falsified
+    description: "Results disprove the hypothesis, need to pivot"

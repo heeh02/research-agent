@@ -1,0 +1,102 @@
+# Experiment Runner Pipeline
+# Triggered when experiment code is merged to staging-experiment branch
+# Runs the full experiment and logs results to tracking system
+
+name: Run Experiment
+
+on:
+  push:
+    branches: [staging-experiment]
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Project ID to run experiments for'
+        required: true
+      experiment_name:
+        description: 'Experiment name'
+        required: true
+      gpu_type:
+        description: 'GPU type (if needed)'
+        required: false
+        default: 'none'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  run-experiment:
+    name: Execute Experiment
+    runs-on: ubuntu-latest  # Change to self-hosted GPU runner if needed
+    timeout-minutes: 360    # 6 hour max
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Find experiment to run
+        id: find-exp
+        run: |
+          # Find the latest run manifest
+          MANIFEST=$(find projects -name "run_manifest*.yaml" -newer projects -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
+          if [ -z "$MANIFEST" ]; then
+            echo "No run manifest found"
+            exit 1
+          fi
+          echo "manifest=$MANIFEST" >> $GITHUB_OUTPUT
+
+          # Extract entry point
+          ENTRY=$(python -c "
+          import yaml
+          m = yaml.safe_load(open('$MANIFEST'))
+          print(m.get('entry_point', ''))
+          ")
+          echo "entry=$ENTRY" >> $GITHUB_OUTPUT
+
+          ARGS=$(python -c "
+          import yaml
+          m = yaml.safe_load(open('$MANIFEST'))
+          print(m.get('args', ''))
+          ")
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+
+      - name: Run experiment
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+        run: |
+          echo "Running: ${{ steps.find-exp.outputs.entry }} ${{ steps.find-exp.outputs.args }}"
+          python ${{ steps.find-exp.outputs.entry }} ${{ steps.find-exp.outputs.args }}
+
+      - name: Collect results
+        if: always()
+        run: |
+          # Ensure results directory exists and has content
+          mkdir -p experiment_results
+          cp -r projects/**/results/* experiment_results/ 2>/dev/null || true
+          cp -r projects/**/logs/* experiment_results/ 2>/dev/null || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-results-${{ github.run_id }}
+          path: experiment_results/
+          retention-days: 90
+
+      - name: Commit results back
+        if: success()
+        run: |
+          git config user.name "Research Agent Bot"
+          git config user.email "research-agent@bot"
+          git add -A projects/**/results/ projects/**/logs/
+          git diff --staged --quiet || git commit -m "experiment: add results from run ${{ github.run_id }}"
+          git push

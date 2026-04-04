@@ -1,0 +1,27 @@
+# Schema for result_report artifact
+required_fields:
+  - hypothesis_recap
+  - experiments_run
+  - key_results
+  - claims_supported
+  - limitations
+  - conclusion
+
+field_types:
+  hypothesis_recap: string
+  experiments_run: list
+  key_results: list
+  statistical_significance: string
+  ablation_findings: list
+  claims_supported: list
+  claims_not_supported: list
+  alternative_explanations: list
+  limitations: list
+  future_work: list
+  conclusion: string
+
+min_lengths:
+  experiments_run: 1
+  key_results: 1
+  claims_supported: 1
+  limitations: 1

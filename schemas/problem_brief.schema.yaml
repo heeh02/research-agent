@@ -1,0 +1,27 @@
+# Schema for problem_brief artifact
+required_fields:
+  - domain
+  - problem_statement
+  - motivation
+  - scope
+  - existing_approaches
+  - limitations_of_existing
+  - proposed_direction
+  - success_criteria
+  - key_references
+
+field_types:
+  domain: string
+  problem_statement: string
+  motivation: string
+  scope: string
+  existing_approaches: list
+  limitations_of_existing: list
+  proposed_direction: string
+  success_criteria: string
+  key_references: list
+
+min_lengths:
+  existing_approaches: 3
+  limitations_of_existing: 2
+  key_references: 5

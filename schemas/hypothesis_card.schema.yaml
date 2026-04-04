@@ -1,0 +1,33 @@
+# Schema for hypothesis_card artifact
+required_fields:
+  - claim
+  - motivation
+  - why_now
+  - novelty_argument
+  - key_assumptions
+  - testable_predictions
+  - baseline_comparison
+  - expected_improvement
+  - key_risks
+  - kill_criteria
+  - minimum_viable_experiment
+
+field_types:
+  claim: string
+  motivation: string
+  why_now: string
+  novelty_argument: string
+  key_assumptions: list
+  testable_predictions: list
+  baseline_comparison: string
+  expected_improvement: string
+  key_risks: list
+  kill_criteria: list
+  minimum_viable_experiment: string
+  estimated_compute_budget: string
+
+min_lengths:
+  key_assumptions: 2
+  testable_predictions: 2
+  key_risks: 2
+  kill_criteria: 2

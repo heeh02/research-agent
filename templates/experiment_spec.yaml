@@ -1,0 +1,81 @@
+# Experiment Specification Template
+# Complete specification for reproducible experiments
+
+experiment_name: ""
+hypothesis_reference: ""            # Which hypothesis card this tests
+
+datasets:
+  - name: ""
+    source: ""                      # URL or path
+    preprocessing: ""
+    split_strategy: ""              # e.g., "80/10/10 train/val/test"
+
+models:
+  - name: ""
+    type: "baseline"                # baseline | proposed | ablation
+    config:
+      architecture: ""
+      parameters: {}
+    is_baseline: true
+
+  - name: ""
+    type: "proposed"
+    config:
+      architecture: ""
+      parameters: {}
+    is_baseline: false
+
+training:
+  optimizer: ""
+  learning_rate: 0.001
+  scheduler: ""
+  epochs: 100
+  batch_size: 32
+  early_stopping:
+    patience: 10
+    metric: ""
+
+evaluation:
+  metrics:
+    - name: ""
+      higher_is_better: true
+  statistical_test: ""              # e.g., "paired t-test"
+  confidence_level: 0.95
+  n_runs: 3                         # Number of random seeds
+  report_mean_std: true
+
+ablations:
+  - name: ""
+    description: ""
+    variable: ""
+    values: []
+
+compute_budget:
+  gpu_type: ""
+  gpu_hours: 0
+  estimated_cost: ""
+
+success_criteria:
+  - metric: ""
+    threshold: 0.0
+    comparison: ">"                 # > or < or >= or <=
+
+kill_criteria:
+  - condition: ""
+    action: ""                      # e.g., "abort and rollback to hypothesis"
+
+failure_plan:
+  - scenario: ""
+    response: ""
+
+environment:
+  python_version: "3.11"
+  key_packages:
+    - "torch==2.2.0"
+    - "numpy==1.26.0"
+
+output_structure:
+  results/: "experiment outputs, metrics, plots"
+  logs/: "training logs, system logs"
+  checkpoints/: "model checkpoints"
+  configs/: "hydra/argparse configs used"

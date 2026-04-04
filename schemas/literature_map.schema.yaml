@@ -1,0 +1,23 @@
+# Schema for literature_map artifact
+required_fields:
+  - research_question
+  - search_scope
+  - papers
+  - method_taxonomy
+  - identified_gaps
+  - recommended_baselines
+
+field_types:
+  research_question: string
+  search_scope: string
+  papers: list
+  method_taxonomy: mapping
+  identified_gaps: list
+  conflicting_findings: list
+  trend_analysis: string
+  recommended_baselines: list
+
+min_lengths:
+  papers: 5
+  identified_gaps: 2
+  recommended_baselines: 2
