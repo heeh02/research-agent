@@ -30,8 +30,9 @@ from .models import AgentRole, CostRecord, LLMProvider, ProjectState, Stage
 # ---------------------------------------------------------------------------
 
 class AgentToolset(str, Enum):
-    RESEARCHER = "Read,Write,Glob,Grep,WebSearch,WebFetch"
-    ENGINEER = "Read,Write,Edit,Bash,Glob,Grep"
+    # Agent = subagent spawning (deep research, parallel searches, code exploration)
+    RESEARCHER = "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
+    ENGINEER = "Read,Write,Edit,Bash,Glob,Grep,Agent"
     ORCHESTRATOR = "Read,Write,Bash,Glob,Grep"
 
 
@@ -41,9 +42,15 @@ DEFAULT_AGENT_MODELS: dict[AgentRole, str] = {
     AgentRole.ORCHESTRATOR: "claude-sonnet-4-20250514",
 }
 
+DEFAULT_AGENT_EFFORT: dict[AgentRole, str] = {
+    AgentRole.RESEARCHER: "max",    # Deep thinking for research quality
+    AgentRole.ENGINEER: "high",
+    AgentRole.ORCHESTRATOR: "medium",
+}
+
 DEFAULT_MAX_TURNS: dict[AgentRole, int] = {
-    AgentRole.RESEARCHER: 15,
-    AgentRole.ENGINEER: 25,
+    AgentRole.RESEARCHER: 30,   # More turns: subagents need room
+    AgentRole.ENGINEER: 40,     # More turns: code + test + debug
     AgentRole.ORCHESTRATOR: 10,
 }
 
@@ -170,6 +177,11 @@ class MultiAgentDispatcher:
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ENGINEER]),
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ORCHESTRATOR]),
         }
+        self.effort: dict[AgentRole, str] = {
+            AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.RESEARCHER]),
+            AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ENGINEER]),
+            AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ORCHESTRATOR]),
+        }
         self.max_turns: dict[AgentRole, int] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ENGINEER]),
@@ -185,12 +197,13 @@ class MultiAgentDispatcher:
         prompt = self._build_prompt(task)
         toolset = self._get_toolset(role)
         model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-20250514"))
+        effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
 
         last_result = None
         for attempt in range(self.max_retries + 1):
             start = time.time()
             try:
-                output, exit_code = self._run_claude(prompt, toolset, model)
+                output, exit_code = self._run_claude(prompt, toolset, model, effort)
             except subprocess.TimeoutExpired:
                 output = "ERROR: Agent process timed out after 600 seconds"
                 exit_code = 124
@@ -215,6 +228,9 @@ class MultiAgentDispatcher:
             # Not retryable or succeeded
             output_files = self._detect_output_files(task, output)
             success = exit_code == 0 and bool(output_files)
+
+            # Save FULL output to log file (never truncate)
+            self._save_full_log(task, output)
 
             last_result = AgentResult(
                 task_id=task.task_id, role=role, success=success,
@@ -299,18 +315,22 @@ class MultiAgentDispatcher:
             AgentRole.ORCHESTRATOR: AgentToolset.ORCHESTRATOR.value,
         }.get(role, AgentToolset.ENGINEER.value)
 
-    def _run_claude(self, prompt: str, allowed_tools: str, model: str) -> tuple[str, int]:
+    def _run_claude(self, prompt: str, allowed_tools: str, model: str,
+                    effort: str = "high") -> tuple[str, int]:
         cmd = [
             "claude", "-p",
             "--output-format", "text",
             "--model", model,
+            "--effort", effort,
             "--allowedTools", allowed_tools,
         ]
+        # Subagents + max effort need more time
+        timeout = 900 if effort == "max" else 600
         result = subprocess.run(
             cmd, input=prompt,
             cwd=str(self.project_dir),
             capture_output=True, text=True,
-            timeout=600,
+            timeout=timeout,
             env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "agent-dispatch"},
         )
         output = result.stdout
@@ -377,18 +397,27 @@ class MultiAgentDispatcher:
         )
         duration = time.time() - start
 
-        review_path = (
-            self.project_dir / "projects" / task.metadata.get("project_id", "default")
-            / "artifacts" / task.stage.value / f"review_{task.task_id}.yaml"
-        )
+        pid = task.metadata.get("project_id", "default")
+        base = self.project_dir / "projects" / pid
+
+        # Save structured review YAML (properly formatted, no string-escaping dicts)
+        review_path = base / "artifacts" / task.stage.value / f"review_{task.task_id}.yaml"
         review_path.parent.mkdir(parents=True, exist_ok=True)
-        review_path.write_text(yaml.dump({
-            "verdict": result.verdict, "scores": result.scores,
+        review_data = {
+            "verdict": result.verdict,
+            "scores": result.scores,
             "blocking_issues": result.blocking_issues,
             "suggestions": result.suggestions,
             "strongest_objection": result.strongest_objection,
             "what_would_make_it_pass": result.what_would_make_it_pass,
-        }, default_flow_style=False, allow_unicode=True))
+        }
+        review_path.write_text(
+            yaml.dump(review_data, default_flow_style=False, allow_unicode=True, width=120),
+            encoding="utf-8",
+        )
+
+        # Save FULL raw Codex output to log (never truncated)
+        self._save_full_log(task, result.raw_output)
 
         return AgentResult(
             task_id=task.task_id, role=AgentRole.CRITIC,
@@ -404,3 +433,12 @@ class MultiAgentDispatcher:
             if (self.project_dir / expected).exists():
                 found.append(expected)
         return found
+
+    def _save_full_log(self, task: TaskCard, output: str) -> Path:
+        """Save the complete agent/codex output to a log file. Never truncated."""
+        pid = task.metadata.get("project_id", "default")
+        log_dir = self.project_dir / "projects" / pid / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.task_id}.txt"
+        log_file.write_text(output, encoding="utf-8")
+        return log_file

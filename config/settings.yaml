@@ -19,25 +19,36 @@ agents:
   researcher:
     provider: claude
     model: claude-sonnet-4-20250514
-    max_turns: 15
-    allowed_tools: "Read,Write,Glob,Grep,WebSearch,WebFetch"
+    effort: max                  # Maximum thinking depth for research quality
+    max_turns: 30                # Subagents need more turns
+    allowed_tools: "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
+    # Agent tool enables subagents for:
+    #   - Parallel paper searches (multiple WebSearch subagents)
+    #   - Deep dive into specific topics
+    #   - Cross-reference verification
 
   critic:
     provider: codex
-    model: gpt-5.4              # GPT-5.4 for strongest review
-    effort: xhigh               # Maximum reasoning depth
+    model: gpt-5.4
+    effort: xhigh
     description: >
       Codex process for adversarial review with GPT-5.4 xhigh.
 
   engineer:
     provider: claude
     model: claude-sonnet-4-20250514
-    max_turns: 25
-    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep"
+    effort: high
+    max_turns: 40
+    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep,Agent"
+    # Agent tool enables subagents for:
+    #   - Parallel code exploration
+    #   - Running tests in isolated worktrees
+    #   - Debugging assistance
 
   orchestrator:
     provider: claude
     model: claude-sonnet-4-20250514
+    effort: medium
     max_turns: 10
     allowed_tools: "Read,Write,Bash,Glob,Grep"
 

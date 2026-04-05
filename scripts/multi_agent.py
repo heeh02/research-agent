@@ -197,7 +197,8 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
 
     ver = state.current_version()
     print(f"┌─ v{ver} Dispatching: {role.value} agent")
-    print(f"│  Stage: {stage.value} | Model: {dispatcher.models.get(role, '?')}")
+    eff = dispatcher.effort.get(role, 'high')
+    print(f"│  Stage: {stage.value} | Model: {dispatcher.models.get(role, '?')} | Effort: {eff}")
     print(f"│  Tools: {dispatcher._get_toolset(role)}")
     print(f"└─ Running...")
     print()
@@ -232,7 +233,7 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
         artifacts_produced=result.output_files,
         cost_usd=result.cost_usd,
         duration_seconds=result.duration_seconds,
-        detail=result.output_text[:1500],
+        detail=result.output_text,
     )
 
     for output_path in result.output_files:
@@ -300,10 +301,10 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
         checks=[GateCheck(
             name="codex_review", description="Codex adversarial review (gpt-5.4 xhigh)",
             check_type="codex", passed=verdict == "PASS",
-            feedback=result.output_text[:2000],
+            feedback=result.output_text,
         )],
         reviewer=AgentRole.CRITIC,
-        overall_feedback=result.output_text[:2000],
+        overall_feedback=result.output_text,
         iteration=state.iteration_count.get(stage.value, 1),
     )
 
@@ -316,7 +317,7 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
         agent=AgentRole.CRITIC,
         gate_verdict=verdict,
         duration_seconds=result.duration_seconds,
-        detail=result.output_text[:1500],
+        detail=result.output_text,
     )
     sm.save_project(state)
 

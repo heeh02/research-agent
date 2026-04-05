@@ -290,7 +290,7 @@ class ProjectState(BaseModel):
             agent=agent,
             stage=self.current_stage,
             summary=summary,
-            detail=detail[:3000],
+            detail=detail,
             artifacts_produced=artifacts_produced or [],
             artifacts_reviewed=artifacts_reviewed or [],
             gate_verdict=gate_verdict,
