@@ -227,9 +227,14 @@ class PipelineRunner:
         self.log(f"└─ Files: {result.output_files}")
 
         state = self.sm.load_project(pid)
+        # Build descriptive summary for GUI timeline
+        backend = d.backends.get(role, CLIBackend.CLAUDE)
+        file_names = [Path(p).name for p in result.output_files]
+        summary = f"{role.value} ({backend.value}) → {', '.join(file_names) or 'no files'}"
+
         state.record_event(
             VersionEventType.AGENT_RUN,
-            f"{role.value} → {stage.value}",
+            summary,
             agent=role, artifacts_produced=result.output_files,
             cost_usd=result.cost_usd, duration_seconds=result.duration_seconds,
             detail=result.output_text,
@@ -263,20 +268,26 @@ class PipelineRunner:
                 pass
 
         review_instruction = (
-            f"You are an adversarial scientific reviewer. Review the {stage.value} artifacts.\n\n"
+            f"CRITICAL RULES:\n"
+            f"- You are a REVIEWER. Do NOT write files. Do NOT create v2 artifacts.\n"
+            f"- ONLY output a review YAML block in your response.\n\n"
+            f"Review the {stage.value} artifacts below.\n\n"
             f"## Review Criteria\n{criteria}\n\n"
             f"## Artifacts to Review\n" + "\n\n".join(art_summaries) + "\n\n"
-            f"## Required Output Format\n"
-            f"You MUST output a YAML block with these exact fields:\n"
+            f"## Required Output (print this YAML, do NOT write any files)\n"
             f"```yaml\n"
             f"verdict: PASS | REVISE | FAIL\n"
-            f"scores: {{rigor: 0.0-1.0, completeness: 0.0-1.0, clarity: 0.0-1.0, novelty: 0.0-1.0}}\n"
-            f"blocking_issues: [list of issues that MUST be fixed]\n"
-            f"suggestions: [list of improvements]\n"
-            f"strongest_objection: <the single biggest problem>\n"
-            f"what_would_make_it_pass: <concrete actionable guidance>\n"
+            f"scores:\n"
+            f"  rigor: 0.0-1.0\n"
+            f"  completeness: 0.0-1.0\n"
+            f"  clarity: 0.0-1.0\n"
+            f"  novelty: 0.0-1.0\n"
+            f"blocking_issues: []\n"
+            f"suggestions: []\n"
+            f"strongest_objection: \"\"\n"
+            f"what_would_make_it_pass: \"\"\n"
             f"```\n"
-            f"VERDICT must be exactly one of: PASS, REVISE, or FAIL.\n"
+            f"PASS only if ALL scores >= 0.7 AND no blocking issues.\n"
         )
 
         task = self._build_task(state, stage, AgentRole.CRITIC, review_instruction)

@@ -258,12 +258,18 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
 
     # Build proper review instruction so non-codex critics know the expected format
     review_instr = (
-        f"You are an adversarial scientific reviewer. Review the {stage.value} artifacts.\n\n"
+        f"CRITICAL: You are a REVIEWER. Do NOT write any files. Do NOT create v2 artifacts.\n"
+        f"ONLY output a review YAML block.\n\n"
+        f"Review the {stage.value} artifacts.\n\n"
         f"## Review Criteria\n{criteria}\n\n"
-        f"## Required Output Format\n"
-        f"Output a YAML block with: verdict (PASS|REVISE|FAIL), scores, "
-        f"blocking_issues, suggestions, strongest_objection, what_would_make_it_pass.\n"
-        f"VERDICT must be exactly one of: PASS, REVISE, or FAIL.\n"
+        f"## Required Output (print YAML, do NOT write files)\n"
+        f"verdict: PASS | REVISE | FAIL\n"
+        f"scores: {{rigor, completeness, clarity, novelty}} each 0.0-1.0\n"
+        f"blocking_issues: [list]\n"
+        f"suggestions: [list]\n"
+        f"strongest_objection: str\n"
+        f"what_would_make_it_pass: str\n\n"
+        f"PASS only if ALL scores >= 0.7 AND no blocking issues.\n"
     )
     task = build_task_card(state, stage, AgentRole.CRITIC, project_id, review_instr)
 

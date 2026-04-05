@@ -203,6 +203,18 @@ class MultiAgentDispatcher:
         model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-20250514"))
         effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
 
+        # Critic doesn't produce files — it outputs verdict in stdout
+        is_critic = (role == AgentRole.CRITIC)
+        if is_critic:
+            # Don't wait for file creation; critic output is in the text
+            task = TaskCard(
+                task_id=task.task_id, role=task.role, stage=task.stage,
+                instruction=task.instruction, context_files=task.context_files,
+                required_outputs=[],  # Critic writes NO files
+                previous_feedback=task.previous_feedback,
+                constraints=task.constraints, metadata=task.metadata,
+            )
+
         last_result = None
         for attempt in range(self.max_retries + 1):
             start = time.time()
@@ -235,7 +247,11 @@ class MultiAgentDispatcher:
                 continue
 
             output_files = self._detect_output_files(task, output)
-            success = exit_code == 0 and bool(output_files)
+            # Critic success = has verdict in output (no files needed)
+            if is_critic:
+                success = exit_code == 0 or "verdict:" in output.lower()
+            else:
+                success = exit_code == 0 and bool(output_files)
 
             self._save_full_log(task, output)
 
@@ -374,7 +390,11 @@ class MultiAgentDispatcher:
         cmd.append(prompt)
 
         # OpenCode agents are slower (subagents + web fetching) — need more time
-        timeout = 1800 if effort == "max" else 1200
+        # But if no expected_files (e.g. critic), use shorter timeout
+        if expected_files:
+            timeout = 1800 if effort == "max" else 1200
+        else:
+            timeout = 600  # Critic / no-file tasks: 10 min max
         _log = progress_fn or (lambda msg: None)
 
         # Monitor opencode's tool-output directory for activity
@@ -423,6 +443,14 @@ class MultiAgentDispatcher:
                     files_found = True
                     _log(f"  Output files detected! ({elapsed}s)")
                     time.sleep(3)  # Let opencode finish cleanup
+                    break
+            else:
+                # No expected files (critic mode): check if stdout has verdict
+                current_output = "".join(output_lines)
+                if "verdict:" in current_output.lower() and "```" in current_output:
+                    files_found = True  # Use this flag to signal "output ready"
+                    _log(f"  Review verdict received ({elapsed}s)")
+                    time.sleep(2)
                     break
 
             # Heartbeat every 15 seconds with activity detection
