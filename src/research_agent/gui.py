@@ -43,6 +43,8 @@ class PipelineRunner:
         self.base_dir = base_dir
         self.config = config
         self._dispatcher: Optional[MultiAgentDispatcher] = None
+        self._cfg_ver = 0
+        self._cur_cfg_ver = 0
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -64,15 +66,17 @@ class PipelineRunner:
         (self.base_dir / ".active_project").write_text(pid, encoding="utf-8")
 
     def _get_dispatcher(self) -> MultiAgentDispatcher:
-        if self._dispatcher is None or id(self.config) != getattr(self, '_cfg_id', None):
+        if self._dispatcher is None or self._cfg_ver != self._cur_cfg_ver:
             self._dispatcher = MultiAgentDispatcher(
                 self.base_dir, self.base_dir / "agents", self.config)
-            self._cfg_id = id(self.config)
+            self._cfg_ver = self._cur_cfg_ver
         return self._dispatcher
 
     def reload_config(self, config: dict):
         self.config = config
+        self._cur_cfg_ver += 1
         self._dispatcher = None
+        self.log(f"Config reloaded (v{self._cur_cfg_ver}). New settings apply to next step.")
 
     def log(self, msg: str):
         self.log_lines.append({"t": datetime.now().strftime("%H:%M:%S"), "m": msg})
@@ -425,72 +429,90 @@ def _get_opencode_models() -> list[str]:
 # ---------------------------------------------------------------------------
 
 _HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Research Agent</title>
 <style>
-:root {
-  --bg:#0d1117;--sf:#161b22;--bd:#30363d;--tx:#e6edf3;--dim:#8b949e;--br:#f0f6fc;
-  --gr:#3fb950;--rd:#f85149;--yl:#d29922;--bl:#58a6ff;--pu:#bc8cff;--cy:#39d2c0;--or:#f0883e;
-}
+:root{--bg:#0d1117;--sf:#161b22;--bd:#30363d;--tx:#e6edf3;--dim:#8b949e;--br:#f0f6fc;
+--gr:#3fb950;--rd:#f85149;--yl:#d29922;--bl:#58a6ff;--pu:#bc8cff;--cy:#39d2c0;--or:#f0883e}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'SF Mono','Cascadia Code','Consolas',monospace;background:var(--bg);color:var(--tx);line-height:1.5;font-size:12px}
-.wrap{max-width:1440px;margin:0 auto;padding:10px 16px;display:flex;flex-direction:column;height:100vh}
-button{font-family:inherit;cursor:pointer}
-select,input{font-family:inherit;background:var(--sf);border:1px solid var(--bd);color:var(--tx);padding:4px 8px;border-radius:4px;font-size:11px}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--tx);line-height:1.5;font-size:13px}
+button{font-family:inherit;cursor:pointer;font-size:12px}
+button:disabled{opacity:.35;cursor:not-allowed}
+select,input{font-family:inherit;background:var(--sf);border:1px solid var(--bd);color:var(--tx);padding:4px 8px;border-radius:5px;font-size:12px}
 select:focus,input:focus{border-color:var(--bl);outline:none}
 
+/* === LAYOUT: sidebar + content === */
+.app{display:flex;height:100vh;overflow:hidden}
+
+/* Left sidebar — project list (Claude.ai style) */
+.sidebar{width:260px;background:var(--sf);border-right:1px solid var(--bd);display:flex;flex-direction:column;flex-shrink:0}
+.sb-hdr{padding:14px 16px 10px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between}
+.sb-hdr h2{font-size:14px;color:var(--br)}
+.sb-new{background:var(--bl);color:var(--bg);border:none;padding:4px 12px;border-radius:5px;font-weight:600;font-size:11px}
+.sb-new:hover{opacity:.85}
+.sb-list{flex:1;overflow-y:auto;padding:6px 0}
+.sb-item{padding:10px 16px;cursor:pointer;display:flex;align-items:center;gap:10px;border-left:3px solid transparent;transition:.1s}
+.sb-item:hover{background:rgba(255,255,255,.04)}
+.sb-item.active{background:rgba(88,166,255,.1);border-left-color:var(--bl)}
+.sb-item .pi-info{flex:1;min-width:0}
+.sb-item .pi-name{font-size:12px;font-weight:500;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-item .pi-stage{font-size:10px;color:var(--dim)}
+.sb-item .pi-del{opacity:0;background:none;border:none;color:var(--dim);font-size:14px;padding:0 4px;line-height:1}
+.sb-item:hover .pi-del{opacity:.6}
+.sb-item .pi-del:hover{color:var(--rd);opacity:1}
+
+/* Spinner */
+.spinner{width:14px;height:14px;border:2px solid var(--bd);border-top-color:var(--bl);border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Right content */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden;padding:0 20px 12px}
+
 /* Header */
-.hdr{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
-.hdr h1{font-size:14px;color:var(--br);white-space:nowrap}
-.hdr .sep{flex:1}
+.hdr{display:flex;align-items:center;gap:10px;padding:12px 0 8px;flex-wrap:wrap}
+.hdr h1{font-size:16px;color:var(--br);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .badge{padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600}
 .badge-v{background:var(--bl);color:var(--bg)}
 .badge-cost{color:var(--yl)}
-.btn{background:var(--sf);border:1px solid var(--bd);color:var(--dim);padding:3px 10px;border-radius:5px;font-size:11px}
-.btn:hover{border-color:var(--bl);color:var(--tx)}
+.btn{background:var(--sf);border:1px solid var(--bd);color:var(--dim);padding:4px 12px;border-radius:5px;font-size:12px}
+.btn:hover:not(:disabled){border-color:var(--bl);color:var(--tx)}
 .btn.active{background:var(--bl);color:var(--bg);border-color:var(--bl)}
-.btn-gr{background:var(--gr);color:var(--bg);border:none;font-weight:600}
-.btn-gr:hover{opacity:.85}
-.btn-rd{background:var(--rd);color:#fff;border:none;font-weight:600}
-.btn-yl{background:var(--yl);color:var(--bg);border:none;font-weight:600}
 
 /* Control bar */
-.ctrl{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
-.ctrl label{color:var(--dim);font-size:10px}
-.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.dot-idle{background:var(--dim)}
-.dot-run{background:var(--gr);animation:pulse 1s infinite}
-.dot-wait{background:var(--yl);animation:pulse 1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.ctrl{display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.ctrl label{color:var(--dim);font-size:11px}
+.btn-run{background:var(--gr);color:var(--bg);border:none;padding:5px 16px;border-radius:5px;font-weight:600}
+.btn-run:hover:not(:disabled){opacity:.85}
+.btn-stop{background:var(--rd);color:#fff;border:none;padding:5px 12px;border-radius:5px;font-weight:600}
+.btn-approve{background:var(--yl);color:var(--bg);border:none;padding:5px 14px;border-radius:5px;font-weight:600}
+.status-pill{display:flex;align-items:center;gap:6px;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:500}
+.status-pill.idle{background:rgba(139,148,158,.15);color:var(--dim)}
+.status-pill.running{background:rgba(63,185,80,.15);color:var(--gr)}
+.status-pill.waiting{background:rgba(210,153,34,.15);color:var(--yl)}
 
-/* Settings panel */
-.panel{display:none;background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:12px;margin:8px 0}
+/* Settings */
+.panel{display:none;background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:14px;margin:8px 0}
 .panel.vis{display:block}
-.panel h3{font-size:12px;color:var(--br);margin-bottom:8px}
+.panel h3{font-size:13px;color:var(--br);margin-bottom:10px}
 .sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
-.acard{background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:10px}
-.acard h4{font-size:11px;margin-bottom:6px;display:flex;align-items:center;gap:5px}
-.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.acard{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:10px}
+.acard h4{font-size:12px;margin-bottom:6px;display:flex;align-items:center;gap:5px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 .dot-researcher{background:var(--bl)}.dot-engineer{background:var(--gr)}.dot-critic{background:var(--pu)}.dot-orchestrator{background:var(--or)}
-.crow{display:flex;align-items:center;gap:6px;margin-bottom:4px}
-.crow label{font-size:10px;color:var(--dim);min-width:45px}
-.crow select,.crow input{flex:1}
+.crow{display:flex;align-items:center;gap:6px;margin-bottom:5px}
+.crow label{font-size:11px;color:var(--dim);min-width:50px}
+.crow select{flex:1}
 
-/* Stages */
-.stages{display:flex;gap:2px;padding:8px 0}
-.schip{flex:1;padding:5px 3px;border-radius:5px;text-align:center;font-size:9px;background:var(--sf);border:1px solid var(--bd);transition:.15s}
+/* Stages bar */
+.stages{display:flex;gap:3px;padding:8px 0}
+.schip{flex:1;padding:6px 4px;border-radius:6px;text-align:center;font-size:10px;background:var(--sf);border:1px solid var(--bd)}
 .schip.done{background:#0d2818;border-color:var(--gr);color:var(--gr)}
 .schip.active{background:#1a1f35;border-color:var(--bl);color:var(--bl);box-shadow:0 0 6px rgba(88,166,255,.2)}
 .schip.failed{background:#2d1215;border-color:var(--rd);color:var(--rd)}
-.schip .al{display:block;font-size:7px;color:var(--dim);margin-top:1px}
+.schip .al{display:block;font-size:8px;color:var(--dim);margin-top:1px}
 
-/* Main area */
-.main{display:grid;grid-template-columns:240px 1fr;gap:10px;flex:1;min-height:0;overflow:hidden;padding:8px 0}
-
-/* Sidebar */
+/* Timeline + Detail */
+.main{display:grid;grid-template-columns:220px 1fr;gap:10px;flex:1;min-height:0;overflow:hidden;padding-top:6px}
 .side{background:var(--sf);border:1px solid var(--bd);border-radius:6px;display:flex;flex-direction:column;overflow:hidden}
 .side h3{padding:8px 12px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--bd);flex-shrink:0}
 .side-scroll{flex:1;overflow-y:auto}
@@ -500,175 +522,195 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .vh.sel{background:rgba(88,166,255,.1);border-left:3px solid var(--bl)}
 .stag{font-size:8px;padding:1px 5px;border-radius:3px;background:var(--bd);color:var(--dim);white-space:nowrap}
 .ves{padding:0 12px 4px}
-.ve{padding:2px 0;font-size:9px;color:var(--dim);display:flex;align-items:center;gap:4px}
+.ve{padding:2px 0;font-size:10px;color:var(--dim);display:flex;align-items:center;gap:4px}
 .ve .ico{width:12px;text-align:center;flex-shrink:0}
 
-/* Detail */
 .det{background:var(--sf);border:1px solid var(--bd);border-radius:6px;display:flex;flex-direction:column;overflow:hidden}
 .det-hdr{padding:10px 14px;border-bottom:1px solid var(--bd);flex-shrink:0;display:flex;justify-content:space-between;align-items:center}
-.det-hdr h2{font-size:13px;color:var(--br)}
+.det-hdr h2{font-size:14px;color:var(--br)}
 .det-scroll{flex:1;overflow-y:auto;padding:10px 14px}
 
-/* Event card */
-.ec{background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:10px;margin-bottom:8px}
+.ec{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:12px;margin-bottom:8px}
 .ec-hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;flex-wrap:wrap;gap:3px}
-.ab{font-size:9px;padding:1px 7px;border-radius:8px;font-weight:600;white-space:nowrap}
+.ab{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;white-space:nowrap}
 .ab-researcher{background:#1a2744;color:var(--bl)}.ab-critic{background:#2a1a2e;color:var(--pu)}
 .ab-engineer{background:#1a2e1e;color:var(--gr)}.ab-human{background:#2e2a1a;color:var(--yl)}
-.ev-s{font-size:11px;flex:1;min-width:0}
-.ev-m{font-size:9px;color:var(--dim);white-space:nowrap}
+.ev-s{font-size:12px;flex:1;min-width:0}.ev-m{font-size:10px;color:var(--dim);white-space:nowrap}
 .vd{font-weight:600}.vd-PASS{color:var(--gr)}.vd-FAIL{color:var(--rd)}.vd-REVISE{color:var(--yl)}
 .scores{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
-.sc{font-size:9px;padding:1px 6px;border-radius:3px;background:var(--bg);border:1px solid var(--bd)}
+.sc{font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg);border:1px solid var(--bd)}
 .sc.p{border-color:var(--gr);color:var(--gr)}.sc.f{border-color:var(--rd);color:var(--rd)}
 .al-list{list-style:none;margin-top:4px}
-.al-list li{font-size:9px;padding:1px 0;color:var(--cy)}
+.al-list li{font-size:10px;padding:1px 0;color:var(--cy)}
 .al-list li::before{content:"\1F4C4 "}
-.dtxt{font-size:10px;white-space:pre-wrap;word-break:break-word;color:var(--tx);background:var(--bg);padding:8px;border-radius:3px;border:1px solid var(--bd);margin-top:6px;max-height:150px;overflow-y:auto;cursor:pointer;transition:max-height .3s}
+.dtxt{font-size:11px;white-space:pre-wrap;word-break:break-word;color:var(--tx);background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--bd);margin-top:6px;max-height:150px;overflow-y:auto;cursor:pointer;transition:max-height .3s;font-family:'SF Mono',Consolas,monospace;font-size:11px}
 .dtxt.exp{max-height:none}
-.dtog{font-size:9px;color:var(--bl);cursor:pointer;margin-top:2px;user-select:none}
+.dtog{font-size:10px;color:var(--bl);cursor:pointer;margin-top:2px;user-select:none}
 
 /* Console */
-.console{background:#000;border:1px solid var(--bd);border-radius:6px;height:160px;display:flex;flex-direction:column;margin-top:8px;flex-shrink:0}
+.console{background:#000;border:1px solid var(--bd);border-radius:6px;height:150px;display:flex;flex-direction:column;margin-top:6px;flex-shrink:0}
 .console-hdr{display:flex;justify-content:space-between;align-items:center;padding:4px 10px;border-bottom:1px solid var(--bd);flex-shrink:0}
-.console-hdr span{font-size:10px;color:var(--dim)}
-.console-body{flex:1;overflow-y:auto;padding:6px 10px;font-size:10px;color:var(--gr);line-height:1.4}
-.console-body .err{color:var(--rd)}
+.console-hdr span{font-size:11px;color:var(--dim)}
+.con-body{flex:1;overflow-y:auto;padding:6px 10px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:var(--gr);line-height:1.4}
+.con-body .err{color:var(--rd)}
 
 /* Modal */
 .modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
 .modal-bg.vis{display:flex}
-.modal{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:20px;width:400px;max-width:90vw}
-.modal h3{font-size:14px;color:var(--br);margin-bottom:12px}
-.modal input{width:100%;margin-bottom:10px;padding:8px;font-size:12px}
-.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.modal{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:24px;width:420px;max-width:90vw}
+.modal h3{font-size:15px;color:var(--br);margin-bottom:14px}
+.modal input{width:100%;margin-bottom:10px;padding:10px;font-size:13px;border-radius:6px}
+.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
 
-@media(max-width:800px){.main{grid-template-columns:1fr}.stages{flex-wrap:wrap}.sgrid{grid-template-columns:1fr}}
-</style>
-</head>
+@media(max-width:900px){.sidebar{width:200px}.main{grid-template-columns:1fr}.stages{flex-wrap:wrap}}
+@media(max-width:640px){.sidebar{display:none}.content{padding:0 10px 8px}}
+</style></head>
 <body>
-<div class="wrap">
-  <!-- Header -->
-  <div class="hdr">
-    <select id="projSel" onchange="switchProject(this.value)" style="max-width:220px"></select>
-    <button class="btn" onclick="showModal()">+ New</button>
-    <h1 id="projName"></h1>
-    <span class="sep"></span>
-    <span class="badge badge-cost" id="costLabel"></span>
-    <span class="badge badge-v" id="verLabel"></span>
-    <button class="btn" id="setBtn" onclick="togglePanel('setPanel',this)">Settings</button>
-    <button class="btn" onclick="location.reload()">Refresh</button>
-  </div>
-
-  <!-- Control bar -->
-  <div class="ctrl">
-    <button class="btn-gr" id="btnAuto" onclick="doAuto()">Auto</button>
-    <button class="btn" id="btnStep" onclick="doStep()">Step</button>
-    <button class="btn" id="btnReview" onclick="doReview()">Review</button>
-    <button class="btn-yl" id="btnApprove" onclick="doApprove()" style="display:none">Approve</button>
-    <button class="btn-rd" id="btnStop" onclick="doStop()" style="display:none">Stop</button>
-    <span style="color:var(--dim);font-size:10px">|</span>
-    <label>Until:</label>
-    <select id="untilStage"><option value="">all</option></select>
-    <label>Rev:</label>
-    <select id="maxRev"><option>1</option><option>2</option><option selected>3</option><option>5</option></select>
-    <label>Instruction:</label>
-    <input id="instrInput" style="flex:1;min-width:100px" placeholder="optional...">
-    <span class="sep"></span>
-    <span class="status-dot dot-idle" id="statusDot"></span>
-    <span id="statusLabel" style="font-size:10px;color:var(--dim)">Idle</span>
-  </div>
-
-  <!-- Settings panel -->
-  <div class="panel" id="setPanel">
-    <h3>CLI Backend Configuration</h3>
-    <div class="sgrid" id="setGrid"></div>
-    <div style="display:flex;align-items:center;margin-top:8px">
-      <button class="btn-gr" onclick="saveSettings()">Save</button>
-      <span id="saveMsg" style="font-size:10px;color:var(--gr);margin-left:10px;display:none"></span>
+<div class="app">
+  <!-- ===== LEFT SIDEBAR — Project List ===== -->
+  <div class="sidebar">
+    <div class="sb-hdr">
+      <h2>Projects</h2>
+      <button class="sb-new" onclick="showModal()">+ New</button>
     </div>
+    <div class="sb-list" id="sbList"></div>
   </div>
 
-  <!-- Stages -->
-  <div class="stages" id="stagesBar"></div>
-
-  <!-- Main: timeline + detail -->
-  <div class="main">
-    <div class="side">
-      <h3>Timeline (<span id="evCnt">0</span>)</h3>
-      <div class="side-scroll" id="timeline"></div>
+  <!-- ===== MAIN CONTENT ===== -->
+  <div class="content">
+    <!-- Header -->
+    <div class="hdr">
+      <h1 id="projName"></h1>
+      <span class="badge badge-cost" id="costLabel"></span>
+      <span class="badge badge-v" id="verLabel"></span>
+      <button class="btn" id="setBtn" onclick="togglePanel('setPanel',this)">Settings</button>
     </div>
-    <div class="det">
-      <div class="det-hdr">
-        <h2 id="detTitle">Select a version</h2>
-        <button class="btn" onclick="toggleAll()">Show All</button>
+
+    <!-- Control bar -->
+    <div class="ctrl">
+      <button class="btn-run" id="btnAuto" onclick="doAuto()">Auto</button>
+      <button class="btn" id="btnStep" onclick="doStep()">Step</button>
+      <button class="btn" id="btnReview" onclick="doReview()">Review</button>
+      <button class="btn-approve" id="btnApprove" onclick="doApprove()" style="display:none">Approve</button>
+      <button class="btn-stop" id="btnStop" onclick="doStop()" style="display:none">Stop</button>
+      <span style="margin:0 4px;color:var(--bd)">|</span>
+      <label>Until</label>
+      <select id="untilStage" style="max-width:140px"><option value="">all stages</option></select>
+      <label>Rev</label>
+      <select id="maxRev" style="width:50px"><option>1</option><option>2</option><option selected>3</option><option>5</option></select>
+      <input id="instrInput" style="flex:1;min-width:80px" placeholder="Instruction (optional)">
+      <div style="flex:999"></div>
+      <div class="status-pill idle" id="statusPill">
+        <span id="statusIcon"></span>
+        <span id="statusLabel">Idle</span>
       </div>
-      <div class="det-scroll" id="detScroll"></div>
     </div>
-  </div>
 
-  <!-- Console -->
-  <div class="console">
-    <div class="console-hdr">
-      <span>Console</span>
-      <button class="btn" style="padding:1px 6px;font-size:9px" onclick="document.getElementById('conBody').innerHTML=''">Clear</button>
+    <!-- Settings panel -->
+    <div class="panel" id="setPanel">
+      <h3>CLI Backend Configuration</h3>
+      <div class="sgrid" id="setGrid"></div>
+      <div style="display:flex;align-items:center;margin-top:10px;gap:10px">
+        <button class="btn-run" onclick="saveSettings()">Save</button>
+        <span id="saveMsg" style="font-size:11px;color:var(--gr);display:none"></span>
+      </div>
     </div>
-    <div class="console-body" id="conBody"></div>
+
+    <!-- Stages -->
+    <div class="stages" id="stagesBar"></div>
+
+    <!-- Timeline + Detail -->
+    <div class="main">
+      <div class="side">
+        <h3>Timeline (<span id="evCnt">0</span>)</h3>
+        <div class="side-scroll" id="timeline"></div>
+      </div>
+      <div class="det">
+        <div class="det-hdr">
+          <h2 id="detTitle">Select a version</h2>
+          <button class="btn" onclick="toggleAll()">Show All</button>
+        </div>
+        <div class="det-scroll" id="detScroll"></div>
+      </div>
+    </div>
+
+    <!-- Console -->
+    <div class="console">
+      <div class="console-hdr">
+        <span>Console</span>
+        <button class="btn" style="padding:1px 6px;font-size:10px" onclick="document.getElementById('conBody').innerHTML=''">Clear</button>
+      </div>
+      <div class="con-body" id="conBody"></div>
+    </div>
   </div>
 </div>
 
-<!-- New Project Modal -->
-<div class="modal-bg" id="modalBg">
+<!-- Modal -->
+<div class="modal-bg" id="modalBg" onclick="if(event.target===this)hideModal()">
   <div class="modal">
     <h3>New Research Project</h3>
     <input id="newName" placeholder="Project name">
     <input id="newQ" placeholder="Research question">
     <div class="btns">
       <button class="btn" onclick="hideModal()">Cancel</button>
-      <button class="btn-gr" onclick="createProject()">Create</button>
+      <button class="btn-run" onclick="createProject()">Create</button>
     </div>
   </div>
 </div>
 
 <script>
 let DATA=__DATA__,STAGES=__STAGES__,CFG=__CFG__,PROJECTS=__PROJECTS__,PID=__PID__,PIPE=__PIPE__;
-const OC_MODELS=__OC__;
+const OC_MODELS=__OC__,STAGE_NAMES=__STAGE_NAMES__;
 const BACKENDS=['claude','codex','opencode'];
 const MODELS={claude:['claude-sonnet-4-20250514','claude-opus-4-20250514','claude-haiku-4-5-20251001'],codex:['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],opencode:OC_MODELS};
 const EFFORTS={claude:['max','high','medium','low'],codex:['xhigh','high','medium','low'],opencode:['max','high','medium','low','minimal']};
 const ROLES=['researcher','engineer','critic','orchestrator'];
-const RC={researcher:'bl',engineer:'gr',critic:'pu',orchestrator:'or'};
-const STAGE_NAMES=__STAGE_NAMES__;
 const ICONS={agent_run:'\u25B6',gate_review:'\u25C6',gate_passed:'\u2713',gate_failed:'\u2717',stage_advance:'\u23E9',stage_rollback:'\u21A9',human_approve:'\uD83D\uDC64',human_reject:'\u270B',human_feedback:'\uD83D\uDCAC'};
 const ICOLORS={agent_run:'var(--bl)',gate_passed:'var(--gr)',gate_failed:'var(--rd)',stage_advance:'var(--cy)',stage_rollback:'var(--or)',human_approve:'var(--gr)',human_reject:'var(--rd)',human_feedback:'var(--yl)'};
 
-// --- Init ---
+// ============ INIT ============
 function init(){
-  // Project selector
-  const ps=document.getElementById('projSel');
-  ps.innerHTML=PROJECTS.map(p=>`<option value="${p.id}" ${p.id===PID?'selected':''}>${p.name} (${p.stage})</option>`).join('');
-  document.getElementById('projName').textContent=DATA.project_name||'';
+  document.getElementById('projName').textContent=DATA.project_name||'No Project';
   document.getElementById('costLabel').textContent='$'+DATA.total_cost;
   document.getElementById('verLabel').textContent='v'+DATA.current_version;
-  // Until stage selector
   const us=document.getElementById('untilStage');
   STAGE_NAMES.forEach(s=>us.innerHTML+=`<option value="${s}">${s.replace(/_/g,' ')}</option>`);
   document.getElementById('evCnt').textContent=DATA.timeline.length;
-  renderStages();renderTimeline();buildSettings();updatePipelineUI();
+  renderSidebar();renderStages();renderTimeline();buildSettings();updateUI();
 }
 
-// --- Stages ---
+// ============ SIDEBAR — project list ============
+function renderSidebar(){
+  const el=document.getElementById('sbList');el.innerHTML='';
+  PROJECTS.forEach(p=>{
+    const isActive=p.id===PID;
+    const isRunning=PIPE.running&&isActive;
+    const d=document.createElement('div');
+    d.className='sb-item'+(isActive?' active':'');
+    d.onclick=()=>{if(!isActive){switchProject(p.id)}};
+    d.innerHTML=`
+      ${isRunning?'<div class="spinner"></div>':''}
+      <div class="pi-info">
+        <div class="pi-name">${p.name}</div>
+        <div class="pi-stage">${p.stage.replace(/_/g,' ')}</div>
+      </div>
+      <button class="pi-del" onclick="event.stopPropagation();delProject('${p.id}')" title="Delete">&times;</button>`;
+    el.appendChild(d);
+  });
+}
+
+// ============ STAGES ============
 function renderStages(){
   const el=document.getElementById('stagesBar');el.innerHTML='';
   STAGES.forEach(s=>{
-    const d=document.createElement('div');d.className='schip '+s.status;
     const bk=(CFG.agents||{})[s.agent]||{};
+    const d=document.createElement('div');d.className='schip '+s.status;
     d.innerHTML=`v${s.index}.x ${s.name.replace(/_/g,' ')}<span class="al">${s.agent} (${bk.backend||'claude'})</span>`;
     el.appendChild(d);
   });
 }
 
-// --- Timeline ---
+// ============ TIMELINE ============
 let versions={},sortedV=[];
 function renderTimeline(){
   versions={};
@@ -705,18 +747,17 @@ function selVer(v,el){
     c.innerHTML=h;sc.appendChild(c);
   });
 }
-
 let allExp=false;
 function toggleAll(){allExp=!allExp;document.querySelectorAll('.dtxt').forEach(e=>{allExp?e.classList.add('exp'):e.classList.remove('exp')})}
 
-// --- Settings ---
+// ============ SETTINGS ============
 function buildSettings(){
   const g=document.getElementById('setGrid');g.innerHTML='';
   ROLES.forEach(r=>{
     const c=(CFG.agents||{})[r]||{};
     const d=document.createElement('div');d.className='acard';
     d.innerHTML=`<h4><span class="dot dot-${r}"></span>${r}</h4>
-      <div class="crow"><label>CLI</label><select id="s-${r}-b" onchange="onBk('${r}')">${BACKENDS.map(b=>`<option ${c.backend===b?'selected':''}>${b}</option>`).join('')}</select></div>
+      <div class="crow"><label>CLI</label><select id="s-${r}-b" onchange="onBk('${r}')">${BACKENDS.map(b=>`<option value="${b}" ${c.backend===b?'selected':''}>${b}</option>`).join('')}</select></div>
       <div class="crow"><label>Model</label><select id="s-${r}-m"></select></div>
       <div class="crow"><label>Effort</label><select id="s-${r}-e"></select></div>`;
     g.appendChild(d);onBk(r,c.model,c.effort);
@@ -725,60 +766,74 @@ function buildSettings(){
 function onBk(r,cm,ce){
   const b=document.getElementById(`s-${r}-b`).value;
   const ms=document.getElementById(`s-${r}-m`),es=document.getElementById(`s-${r}-e`);
-  const ml=MODELS[b]||[];ms.innerHTML=ml.map(m=>`<option>${m}</option>`).join('');if(cm&&ml.includes(cm))ms.value=cm;
-  const el=EFFORTS[b]||['high'];es.innerHTML=el.map(e=>`<option>${e}</option>`).join('');if(ce&&el.includes(ce))es.value=ce;
+  const ml=MODELS[b]||[];ms.innerHTML=ml.map(m=>`<option value="${m}">${m}</option>`).join('');if(cm&&ml.includes(cm))ms.value=cm;
+  const el=EFFORTS[b]||['high'];es.innerHTML=el.map(e=>`<option value="${e}">${e}</option>`).join('');if(ce&&el.includes(ce))es.value=ce;
 }
 function togglePanel(id,btn){const p=document.getElementById(id);const v=p.classList.toggle('vis');if(btn)btn.classList.toggle('active',v)}
 function saveSettings(){
   const s={};ROLES.forEach(r=>s[r]={backend:document.getElementById(`s-${r}-b`).value,model:document.getElementById(`s-${r}-m`).value,effort:document.getElementById(`s-${r}-e`).value});
   fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>{
-    const m=document.getElementById('saveMsg');m.style.display='inline';m.textContent=d.ok?'Saved!':'Error';setTimeout(()=>m.style.display='none',2000);
+    const m=document.getElementById('saveMsg');m.style.display='inline';m.textContent=d.ok?'Saved! Next step will use new settings.':'Error: '+d.error;
+    setTimeout(()=>m.style.display='none',3000);
     if(d.ok){CFG.agents=CFG.agents||{};ROLES.forEach(r=>{CFG.agents[r]={...CFG.agents[r],...s[r]}});renderStages()}
   });
 }
 
-// --- Pipeline control ---
-function doAuto(){post('/api/pipeline/auto',{until:document.getElementById('untilStage').value,max_rev:parseInt(document.getElementById('maxRev').value),instruction:document.getElementById('instrInput').value})}
-function doStep(){post('/api/pipeline/step',{instruction:document.getElementById('instrInput').value})}
-function doReview(){post('/api/pipeline/review',{})}
-function doApprove(){post('/api/pipeline/approve',{})}
-function doStop(){post('/api/pipeline/stop',{})}
-function post(url,data){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(d=>{if(d.error)appendCon(d.error,true)})}
+// ============ PIPELINE CONTROL ============
+function doAuto(){postAPI('/api/pipeline/auto',{until:document.getElementById('untilStage').value,max_rev:parseInt(document.getElementById('maxRev').value),instruction:document.getElementById('instrInput').value})}
+function doStep(){postAPI('/api/pipeline/step',{instruction:document.getElementById('instrInput').value})}
+function doReview(){postAPI('/api/pipeline/review',{})}
+function doApprove(){postAPI('/api/pipeline/approve',{})}
+function doStop(){postAPI('/api/pipeline/stop',{})}
+function postAPI(url,data){
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+  .then(r=>r.json()).then(d=>{
+    if(d.error)appendCon('ERROR: '+d.error,true);
+    // Immediately poll for status update
+    setTimeout(pollStatus,300);
+  });
+}
 
-// --- Pipeline status polling ---
-let lastLogLen=0;
+// ============ POLLING ============
+let lastLogLen=0,lastRunning=false,pollTimer=null;
 function pollStatus(){
   fetch('/api/status').then(r=>r.json()).then(d=>{
-    PIPE=d;updatePipelineUI();
-    // Append new log lines
+    PIPE=d;updateUI();
     if(d.log&&d.log.length>lastLogLen){
-      const newLines=d.log.slice(lastLogLen);
-      newLines.forEach(l=>appendCon(`[${l.t}] ${l.m}`,l.m.includes('ERROR')));
+      d.log.slice(lastLogLen).forEach(l=>appendCon(`[${l.t}] ${l.m}`,l.m.includes('ERROR')));
       lastLogLen=d.log.length;
     }
-    // Refresh state data if pipeline was running
     if(d.running||lastRunning){
       fetch('/api/state').then(r=>r.json()).then(sd=>{
         DATA=sd;
         document.getElementById('verLabel').textContent='v'+sd.current_version;
         document.getElementById('costLabel').textContent='$'+sd.total_cost;
         document.getElementById('evCnt').textContent=sd.timeline.length;
-        renderTimeline();
+        renderTimeline();renderStages();
       });
     }
     lastRunning=d.running;
+    // Adaptive poll rate
+    clearInterval(pollTimer);
+    pollTimer=setInterval(pollStatus,d.running?2000:8000);
   }).catch(()=>{});
 }
-let lastRunning=false;
 
-function updatePipelineUI(){
+function updateUI(){
   const r=PIPE.running,w=PIPE.waiting_approval;
-  const dot=document.getElementById('statusDot');
-  dot.className='status-dot '+(r?(w?'dot-wait':'dot-run'):'dot-idle');
-  document.getElementById('statusLabel').textContent=r?(w?'Awaiting approval':PIPE.mode+': '+PIPE.stage):'Idle';
-  document.getElementById('btnAuto').disabled=r;document.getElementById('btnStep').disabled=r;document.getElementById('btnReview').disabled=r;
+  // Status pill
+  const pill=document.getElementById('statusPill');
+  pill.className='status-pill '+(r?(w?'waiting':'running'):'idle');
+  document.getElementById('statusIcon').innerHTML=r?'<div class="spinner" style="width:10px;height:10px;border-width:1.5px"></div>':'';
+  document.getElementById('statusLabel').textContent=r?(w?'Awaiting Approval':`${PIPE.mode}: ${PIPE.stage}`):'Idle';
+  // Buttons
+  document.getElementById('btnAuto').disabled=r;
+  document.getElementById('btnStep').disabled=r;
+  document.getElementById('btnReview').disabled=r;
   document.getElementById('btnApprove').style.display=w?'inline-block':'none';
   document.getElementById('btnStop').style.display=r?'inline-block':'none';
+  // Sidebar running indicator
+  renderSidebar();
 }
 
 function appendCon(msg,isErr){
@@ -787,8 +842,18 @@ function appendCon(msg,isErr){
   d.textContent=msg;el.appendChild(d);el.scrollTop=el.scrollHeight;
 }
 
-// --- Project management ---
-function switchProject(pid){post('/api/project/switch',{id:pid});setTimeout(()=>location.reload(),300)}
+// ============ PROJECT MANAGEMENT ============
+function switchProject(pid){
+  postAPI('/api/project/switch',{id:pid});
+  setTimeout(()=>location.reload(),400);
+}
+function delProject(pid){
+  if(pid===PID){appendCon('Cannot delete active project',true);return}
+  if(!confirm('Delete this project?'))return;
+  fetch('/api/project/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:pid})}).then(r=>r.json()).then(d=>{
+    if(d.ok){PROJECTS=PROJECTS.filter(p=>p.id!==pid);renderSidebar()}
+  });
+}
 function showModal(){document.getElementById('modalBg').classList.add('vis');document.getElementById('newName').focus()}
 function hideModal(){document.getElementById('modalBg').classList.remove('vis')}
 function createProject(){
@@ -797,14 +862,11 @@ function createProject(){
   fetch('/api/project/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,question:q})}).then(r=>r.json()).then(d=>{if(d.ok)location.reload()});
 }
 
-// Start polling
+// Start
 init();
-setInterval(pollStatus,PIPE.running?2000:5000);
-// Adjust poll rate based on running state
-setInterval(()=>{},60000);
+pollTimer=setInterval(pollStatus,PIPE.running?2000:8000);
 </script>
-</body>
-</html>"""
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1027,17 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
                 try:
                     runner.project_id = body["id"]
                     self._json_ok({"ok": True})
+                except Exception as e:
+                    self._json_ok({"ok": False, "error": str(e)})
+
+            elif self.path == "/api/project/delete":
+                try:
+                    did = body["id"]
+                    if did == (runner.project_id or project_id):
+                        self._json_ok({"ok": False, "error": "Cannot delete active project"})
+                    else:
+                        sm.delete_project(did)
+                        self._json_ok({"ok": True})
                 except Exception as e:
                     self._json_ok({"ok": False, "error": str(e)})
 

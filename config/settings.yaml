@@ -1,59 +1,42 @@
-# Research Agent — Global Settings
-# ================================
-
-pipeline:
-  automation_level: hybrid
-  human_gates:
-    - hypothesis_formation
-    - experimentation
-  max_iterations: 5
-  confirm_before_advance: true
-
-# Agent configurations
-# backend: claude | codex | opencode
 agents:
-  researcher:
-    backend: claude
-    model: claude-sonnet-4-20250514
-    effort: max
-    max_turns: 30
-    allowed_tools: "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
-
   critic:
-    backend: codex
-    model: gpt-5.4
-    effort: xhigh
-
+    backend: opencode
+    effort: high
+    model: volcengine-plan/doubao-seed-2.0-code
   engineer:
-    backend: claude
-    model: claude-sonnet-4-20250514
+    allowed_tools: Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent
+    backend: opencode
     effort: high
     max_turns: 40
-    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent"
-
+    model: volcengine-plan/doubao-seed-2.0-code
   orchestrator:
-    backend: claude
-    model: claude-sonnet-4-20250514
-    effort: medium
+    allowed_tools: Read,Write,Bash,Glob,Grep
+    backend: opencode
+    effort: high
     max_turns: 10
-    allowed_tools: "Read,Write,Bash,Glob,Grep"
-
-# Cost management
+    model: volcengine-plan/doubao-seed-2.0-pro
+  researcher:
+    allowed_tools: Read,Write,Glob,Grep,WebSearch,WebFetch,Agent
+    backend: opencode
+    effort: high
+    max_turns: 30
+    model: volcengine-plan/doubao-seed-2.0-pro
 cost:
-  warning_threshold: 5.0
+  codex_estimated_cost_per_review: 0.1
   hard_limit: 50.0
-  codex_estimated_cost_per_review: 0.10
-
-# Experiment tracking
-tracking:
-  enabled: false
-  backend: mlflow
-
-# GitHub integration
+  warning_threshold: 5.0
 github:
   enabled: false
-
-# Web GUI
 gui:
-  host: "127.0.0.1"
+  host: 127.0.0.1
   port: 8080
+pipeline:
+  automation_level: hybrid
+  confirm_before_advance: true
+  human_gates:
+  - hypothesis_formation
+  - experimentation
+  max_iterations: 5
+tracking:
+  backend: mlflow
+  enabled: false
