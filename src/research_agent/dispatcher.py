@@ -1,12 +1,11 @@
-"""Multi-agent dispatcher — launches separate Claude Code instances per role.
+"""Multi-agent dispatcher — launches CLI tools (claude / codex / opencode) per role.
 
-Each agent is a standalone `claude -p` process with role-specific CLAUDE.md,
-restricted tools, and structured task card.
+Three CLI backends:
+  - claude:   Claude Code CLI (`claude -p`)
+  - codex:    OpenAI Codex CLI (`codex exec`)
+  - opencode: OpenCode CLI (`opencode run`) — supports Doubao, DeepSeek, Kimi, etc.
 
-Fault tolerance:
-- Auto-retry with exponential backoff on transient failures (403, timeout, network)
-- Checkpoint before each dispatch so pipeline can resume
-- Detailed error classification (auth vs network vs agent failure)
+Each agent runs as an independent subprocess with role-specific prompt and tools.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from typing import Any, Optional
 
 import yaml
 
-from .models import AgentRole, CostRecord, LLMProvider, ProjectState, Stage
+from .models import AgentRole, CLIBackend, CostRecord, LLMProvider, ProjectState, Stage
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +29,6 @@ from .models import AgentRole, CostRecord, LLMProvider, ProjectState, Stage
 # ---------------------------------------------------------------------------
 
 class AgentToolset(str, Enum):
-    # Agent = subagent spawning; WebSearch/WebFetch = internet access
     RESEARCHER = "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
     ENGINEER = "Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent"
     ORCHESTRATOR = "Read,Write,Bash,Glob,Grep"
@@ -43,34 +41,25 @@ DEFAULT_AGENT_MODELS: dict[AgentRole, str] = {
 }
 
 DEFAULT_AGENT_EFFORT: dict[AgentRole, str] = {
-    AgentRole.RESEARCHER: "max",    # Deep thinking for research quality
+    AgentRole.RESEARCHER: "max",
     AgentRole.ENGINEER: "high",
     AgentRole.ORCHESTRATOR: "medium",
 }
 
 DEFAULT_MAX_TURNS: dict[AgentRole, int] = {
-    AgentRole.RESEARCHER: 30,   # More turns: subagents need room
-    AgentRole.ENGINEER: 40,     # More turns: code + test + debug
+    AgentRole.RESEARCHER: 30,
+    AgentRole.ENGINEER: 40,
     AgentRole.ORCHESTRATOR: 10,
 }
 
+# OpenCode binary path (user-installed)
+OPENCODE_BIN = os.environ.get("OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
+
 # Errors that are transient and should be retried
 RETRYABLE_PATTERNS = [
-    "403",
-    "api error",
-    "please run /login",
-    "rate limit",
-    "overloaded",
-    "connection reset",
-    "connection refused",
-    "timed out",
-    "timeout",
-    "network",
-    "eof",
-    "broken pipe",
-    "502",
-    "503",
-    "529",
+    "403", "api error", "please run /login", "rate limit", "overloaded",
+    "connection reset", "connection refused", "timed out", "timeout",
+    "network", "eof", "broken pipe", "502", "503", "529",
 ]
 
 
@@ -126,11 +115,10 @@ class AgentResult:
 
 
 # ---------------------------------------------------------------------------
-# Retry helper
+# Retry helpers
 # ---------------------------------------------------------------------------
 
 def _is_retryable(output: str, exit_code: int) -> bool:
-    """Check if the error is transient and worth retrying."""
     if exit_code == 0:
         return False
     combined = output.lower()
@@ -138,13 +126,11 @@ def _is_retryable(output: str, exit_code: int) -> bool:
 
 
 def _is_auth_error(output: str) -> bool:
-    """Check if this is an authentication/login error."""
     lower = output.lower()
     return "403" in lower or "/login" in lower or "please run /login" in lower
 
 
 def _retry_wait(attempt: int) -> float:
-    """Exponential backoff: 10s, 30s, 60s, 120s, ..."""
     return min(10 * (3 ** attempt), 300)
 
 
@@ -153,10 +139,9 @@ def _retry_wait(attempt: int) -> float:
 # ---------------------------------------------------------------------------
 
 class MultiAgentDispatcher:
-    """Launches and manages multiple Claude Code instances as separate agents.
+    """Launches and manages CLI tool instances as separate agents.
 
-    Includes automatic retry with exponential backoff for transient failures
-    (network errors, 403, rate limits, timeouts).
+    Supports three backends: claude (Claude Code), codex (Codex), opencode (OpenCode).
     """
 
     def __init__(
@@ -172,9 +157,21 @@ class MultiAgentDispatcher:
         self.max_retries = max_retries
 
         agent_cfg = self.config.get("agents", {})
+
+        # Parse per-role CLI backend
+        self.backends: dict[AgentRole, CLIBackend] = {}
+        for role in AgentRole:
+            raw = agent_cfg.get(role.value, {}).get("backend", None)
+            if raw:
+                self.backends[role] = CLIBackend(raw)
+            else:
+                # Default: critic→codex, others→claude
+                self.backends[role] = CLIBackend.CODEX if role == AgentRole.CRITIC else CLIBackend.CLAUDE
+
         self.models: dict[AgentRole, str] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ENGINEER]),
+            AgentRole.CRITIC: agent_cfg.get("critic", {}).get("model", "gpt-5.4"),
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ORCHESTRATOR]),
         }
         self.effort: dict[AgentRole, str] = {
@@ -189,11 +186,14 @@ class MultiAgentDispatcher:
         }
 
     def dispatch(self, task: TaskCard) -> AgentResult:
-        """Dispatch with automatic retry on transient failures."""
+        """Dispatch task to the appropriate CLI backend with retry."""
         role = task.role
-        if role == AgentRole.CRITIC:
+        backend = self.backends.get(role, CLIBackend.CLAUDE)
+
+        if backend == CLIBackend.CODEX:
             return self._dispatch_codex_with_retry(task)
 
+        # Claude and OpenCode share the same retry loop
         prompt = self._build_prompt(task)
         toolset = self._get_toolset(role)
         model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-20250514"))
@@ -203,33 +203,32 @@ class MultiAgentDispatcher:
         for attempt in range(self.max_retries + 1):
             start = time.time()
             try:
-                output, exit_code = self._run_claude(prompt, toolset, model, effort)
+                if backend == CLIBackend.OPENCODE:
+                    output, exit_code = self._run_opencode(prompt, model, effort)
+                else:
+                    output, exit_code = self._run_claude(prompt, toolset, model, effort)
             except subprocess.TimeoutExpired:
-                output = "ERROR: Agent process timed out after 600 seconds"
+                output = f"ERROR: {backend.value} process timed out"
                 exit_code = 124
             except Exception as e:
                 output = f"ERROR: {type(e).__name__}: {e}"
                 exit_code = 1
             duration = time.time() - start
 
-            # Check if retryable
             if exit_code != 0 and _is_retryable(output, exit_code) and attempt < self.max_retries:
                 wait = _retry_wait(attempt)
                 auth = _is_auth_error(output)
                 if auth:
-                    print(f"    ⚠ Auth error (403/login required). Waiting {wait:.0f}s then retrying...")
-                    print(f"    ⚠ If this persists, run: /login  or  claude login")
+                    print(f"    ⚠ Auth error. Waiting {wait:.0f}s then retrying...")
                 else:
                     print(f"    ⚠ Transient error (attempt {attempt+1}/{self.max_retries+1}). Retrying in {wait:.0f}s...")
                     print(f"    ⚠ Error: {output[:150]}")
                 time.sleep(wait)
                 continue
 
-            # Not retryable or succeeded
             output_files = self._detect_output_files(task, output)
             success = exit_code == 0 and bool(output_files)
 
-            # Save FULL output to log file (never truncate)
             self._save_full_log(task, output)
 
             last_result = AgentResult(
@@ -254,7 +253,7 @@ class MultiAgentDispatcher:
             return [f.result() for f in concurrent.futures.as_completed(futures)]
 
     # -----------------------------------------------------------------------
-    # Internal — Claude Code
+    # Internal — Claude Code CLI
     # -----------------------------------------------------------------------
 
     def _build_prompt(self, task: TaskCard) -> str:
@@ -314,7 +313,6 @@ class MultiAgentDispatcher:
         role_cfg = agent_cfg.get(role.value, {})
         if "allowed_tools" in role_cfg:
             return role_cfg["allowed_tools"]
-        # Fallback to hardcoded defaults
         return {
             AgentRole.RESEARCHER: AgentToolset.RESEARCHER.value,
             AgentRole.ENGINEER: AgentToolset.ENGINEER.value,
@@ -330,7 +328,6 @@ class MultiAgentDispatcher:
             "--effort", effort,
             "--allowedTools", allowed_tools,
         ]
-        # Subagents + max effort need more time
         timeout = 900 if effort == "max" else 600
         result = subprocess.run(
             cmd, input=prompt,
@@ -345,15 +342,64 @@ class MultiAgentDispatcher:
         return output, result.returncode
 
     # -----------------------------------------------------------------------
-    # Internal — Codex (with retry)
+    # Internal — OpenCode CLI
+    # -----------------------------------------------------------------------
+
+    def _run_opencode(self, prompt: str, model: str,
+                      effort: str = "high") -> tuple[str, int]:
+        """Run opencode run with a prompt. Returns (output, exit_code)."""
+        cmd = [
+            OPENCODE_BIN, "run",
+            "--format", "json",
+            "--dir", str(self.project_dir),
+        ]
+
+        if model:
+            cmd.extend(["-m", model])
+
+        if effort and effort != "none":
+            cmd.extend(["--variant", effort])
+
+        cmd.append(prompt)
+
+        timeout = 900 if effort == "max" else 600
+        result = subprocess.run(
+            cmd,
+            capture_output=True, text=True,
+            timeout=timeout,
+        )
+
+        output = result.stdout
+        # Parse JSON output — extract assistant messages
+        if output.strip():
+            text_parts = []
+            for line in output.strip().split("\n"):
+                try:
+                    event = json.loads(line)
+                    # opencode json format: look for text/assistant content
+                    if isinstance(event, dict):
+                        content = event.get("content", "") or event.get("text", "")
+                        role = event.get("role", "") or event.get("type", "")
+                        if role in ("assistant", "message", "text") and content:
+                            text_parts.append(content)
+                except json.JSONDecodeError:
+                    # Not JSON — raw text output
+                    text_parts.append(line)
+            if text_parts:
+                output = "\n".join(text_parts)
+
+        if result.returncode != 0 and not output.strip():
+            output = result.stderr
+        return output, result.returncode
+
+    # -----------------------------------------------------------------------
+    # Internal — Codex CLI (with retry)
     # -----------------------------------------------------------------------
 
     def _dispatch_codex_with_retry(self, task: TaskCard) -> AgentResult:
-        """Dispatch to Codex with retry on transient failures."""
         for attempt in range(self.max_retries + 1):
             try:
                 result = self._dispatch_codex(task)
-                # Check for auth/network errors in codex output
                 if not result.success and _is_retryable(result.output_text, 1) and attempt < self.max_retries:
                     wait = _retry_wait(attempt)
                     print(f"    ⚠ Codex transient error (attempt {attempt+1}). Retrying in {wait:.0f}s...")
@@ -369,7 +415,7 @@ class MultiAgentDispatcher:
                     continue
                 return AgentResult(
                     task_id=task.task_id, role=AgentRole.CRITIC,
-                    success=False, output_text=f"Codex failed after {attempt+1} attempts: {e}",
+                    success=False, output_text=f"Codex failed: {e}",
                     error=str(e), retries=attempt,
                 )
 
@@ -383,37 +429,19 @@ class MultiAgentDispatcher:
         from .integrations.codex import codex_review
         from .agents.critic import STAGE_REVIEW_CRITERIA
 
-        # Two modes:
-        # 1. If artifact files exist, tell Codex to READ THEM DIRECTLY (codebase-aware)
-        # 2. Fallback: embed readable prose in the prompt
-        file_read_instructions = []
         context_parts = []
         for f in task.context_files:
             p = self.project_dir / f
             if p.exists():
-                file_read_instructions.append(f"Read and review the file: {f}")
-                # Also provide readable version as backup context
                 raw = p.read_text(encoding="utf-8")
                 context_parts.append(self._yaml_to_readable(p.name, raw))
 
         criteria = STAGE_REVIEW_CRITERIA.get(task.stage.value, "Review for rigor.")
 
-        # If Codex can read files, tell it to do so
-        if file_read_instructions:
-            extra_context = (
-                "IMPORTANT: You are running inside the project directory. "
-                "Read the artifact files directly for the most accurate review:\n"
-                + "\n".join(f"  - {inst}" for inst in file_read_instructions)
-                + "\n\nAs backup, here is a readable summary of the artifacts:\n\n"
-                + "\n\n".join(context_parts)
-            )
-        else:
-            extra_context = "\n\n".join(context_parts)
-
         start = time.time()
         result = codex_review(
             stage=task.stage.value,
-            artifact_content=extra_context,
+            artifact_content="\n\n".join(context_parts),
             review_criteria=criteria,
             project_context=task.instruction,
             model=self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4"),
@@ -425,7 +453,6 @@ class MultiAgentDispatcher:
         pid = task.metadata.get("project_id", "default")
         base = self.project_dir / "projects" / pid
 
-        # Save structured review YAML (properly formatted, no string-escaping dicts)
         review_path = base / "artifacts" / task.stage.value / f"review_{task.task_id}.yaml"
         review_path.parent.mkdir(parents=True, exist_ok=True)
         review_data = {
@@ -441,7 +468,6 @@ class MultiAgentDispatcher:
             encoding="utf-8",
         )
 
-        # Save FULL raw Codex output to log (never truncated)
         self._save_full_log(task, result.raw_output)
 
         return AgentResult(
@@ -452,21 +478,21 @@ class MultiAgentDispatcher:
             duration_seconds=duration,
         )
 
+    # -----------------------------------------------------------------------
+    # Shared helpers
+    # -----------------------------------------------------------------------
+
     def _detect_output_files(self, task: TaskCard, output: str) -> list[str]:
-        """Detect output files: check required paths + scan artifact dir for new files."""
         found = set()
-        # Check expected outputs
         for expected in task.required_outputs:
             if (self.project_dir / expected).exists():
                 found.add(expected)
 
-        # Also scan the stage artifact directory for any YAML files the agent wrote
         pid = task.metadata.get("project_id", "")
         if pid:
             art_dir = self.project_dir / "projects" / pid / "artifacts" / task.stage.value
             if art_dir.exists():
                 for f in art_dir.glob("*.yaml"):
-                    # Skip review files (those are from critic)
                     if not f.name.startswith("review_"):
                         rel = f"projects/{pid}/artifacts/{task.stage.value}/{f.name}"
                         found.add(rel)
@@ -474,7 +500,6 @@ class MultiAgentDispatcher:
         return list(found)
 
     def _save_full_log(self, task: TaskCard, output: str) -> Path:
-        """Save the complete agent/codex output to a log file. Never truncated."""
         pid = task.metadata.get("project_id", "default")
         log_dir = self.project_dir / "projects" / pid / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -484,12 +509,6 @@ class MultiAgentDispatcher:
 
     @staticmethod
     def _yaml_to_readable(filename: str, raw_yaml: str) -> str:
-        """Convert a YAML artifact to readable prose for Codex review.
-
-        Codex reviews much better when given a narrative description
-        rather than raw YAML schema. This turns structured data into
-        a readable research document.
-        """
         try:
             data = yaml.safe_load(raw_yaml)
         except yaml.YAMLError:
@@ -499,31 +518,24 @@ class MultiAgentDispatcher:
             return f"## {filename}\n{raw_yaml}"
 
         lines = [f"## {filename}\n"]
-
         for key, value in data.items():
             heading = key.replace("_", " ").title()
-
             if isinstance(value, str):
                 lines.append(f"### {heading}\n{value}\n")
-
             elif isinstance(value, list):
                 lines.append(f"### {heading}")
                 for i, item in enumerate(value, 1):
                     if isinstance(item, dict):
-                        parts = []
-                        for k, v in item.items():
-                            parts.append(f"{k}: {v}")
+                        parts = [f"{k}: {v}" for k, v in item.items()]
                         lines.append(f"  {i}. " + " | ".join(parts))
                     else:
                         lines.append(f"  {i}. {item}")
                 lines.append("")
-
             elif isinstance(value, dict):
                 lines.append(f"### {heading}")
                 for k, v in value.items():
                     lines.append(f"  - {k}: {v}")
                 lines.append("")
-
             else:
                 lines.append(f"### {heading}\n{value}\n")
 

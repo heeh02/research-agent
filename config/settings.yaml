@@ -7,87 +7,60 @@ pipeline:
     - hypothesis_formation
     - experimentation
   max_iterations: 5
-
-  # Version-based confirmation in advance/step mode
-  # Before major (stage advance) or minor (revision) version bump:
-  #   advance/step mode → prompt human yes/no, no → input feedback
-  #   auto mode → skip confirmation, fully automatic
-  confirm_before_advance: true   # Only applies to advance/step mode
+  confirm_before_advance: true
 
 # Agent configurations
+# backend: claude | codex | opencode
+# For opencode models, use format: provider/model (e.g. volcengine-plan/doubao-seed-2.0-pro)
 agents:
   researcher:
-    provider: claude
+    backend: claude
     model: claude-sonnet-4-20250514
-    effort: max                  # Maximum thinking depth for research quality
-    max_turns: 30                # Subagents need more turns
+    effort: max
+    max_turns: 30
     allowed_tools: "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
-    # Agent tool enables subagents for:
-    #   - Parallel paper searches (multiple WebSearch subagents)
-    #   - Deep dive into specific topics
-    #   - Cross-reference verification
 
   critic:
-    provider: codex
+    backend: codex
     model: gpt-5.4
     effort: xhigh
-    description: >
-      Codex process for adversarial review with GPT-5.4 xhigh.
 
   engineer:
-    provider: claude
+    backend: claude
     model: claude-sonnet-4-20250514
     effort: high
     max_turns: 40
     allowed_tools: "Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent"
-    # WebSearch/WebFetch = access GitHub source code, docs, library APIs
-    # Agent = subagents for parallel code exploration, testing, debugging
 
   orchestrator:
-    provider: claude
+    backend: claude
     model: claude-sonnet-4-20250514
     effort: medium
     max_turns: 10
     allowed_tools: "Read,Write,Bash,Glob,Grep"
 
-# Codex plugin configuration
-codex:
-  review_gate:
-    enabled: false
-    stages: [implementation, experimentation]
-  prefer_background: true
-  fallback_to_api: true
-  fallback_model: gpt-5.4
-
-# ByteDance Seedance 2.0 Pro (Volcano Engine ARK)
-bytedance:
-  api_key: "c22b4b4b-c880-4b5c-9455-d9d93e250ac5"
-  base_url: "https://ark.cn-beijing.volces.com/api/v3"
-  model: "seedance-2.0-pro"
+# OpenCode models reference (run: opencode models)
+# volcengine-plan/doubao-seed-2.0-pro
+# volcengine-plan/doubao-seed-2.0-lite
+# volcengine-plan/doubao-seed-2.0-code
+# volcengine-plan/deepseek-v3.2
+# volcengine-plan/kimi-k2.5
+# volcengine-plan/glm-4.7
 
 # Cost management
 cost:
   warning_threshold: 5.0
   hard_limit: 50.0
-  codex_estimated_cost_per_review: 0.10   # GPT-5.4 xhigh is more expensive
+  codex_estimated_cost_per_review: 0.10
 
 # Experiment tracking
 tracking:
   enabled: false
   backend: mlflow
-  mlflow:
-    tracking_uri: "http://localhost:5000"
-    experiment_prefix: "research-agent"
-  wandb:
-    project: "research-agent"
-    entity: null
 
 # GitHub integration
 github:
   enabled: false
-  repo: null
-  branch_prefix: "exp/"
-  require_pr_review: true
 
 # Web GUI
 gui:

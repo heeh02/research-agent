@@ -39,11 +39,19 @@ class AgentRole(str, Enum):
     ENGINEER = "engineer"
 
 
+class CLIBackend(str, Enum):
+    """Which CLI tool dispatches this agent."""
+    CLAUDE = "claude"        # Claude Code CLI (claude -p)
+    CODEX = "codex"          # OpenAI Codex CLI (codex exec)
+    OPENCODE = "opencode"    # OpenCode CLI (opencode run) — supports Doubao/DeepSeek/etc.
+
+
+# Keep LLMProvider as alias for backward compat with state.json serialization
 class LLMProvider(str, Enum):
     CLAUDE = "claude"
     OPENAI = "openai"
-    CODEX = "codex"          # OpenAI Codex CLI via codex-plugin-cc
-    BYTEDANCE = "bytedance"  # ByteDance Seedance via Volcano Engine ARK
+    CODEX = "codex"
+    OPENCODE = "opencode"
     LOCAL = "local"
 
 

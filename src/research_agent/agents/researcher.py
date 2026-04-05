@@ -8,14 +8,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ..models import AgentRole, ArtifactType, LLMProvider, Stage
+from ..models import AgentRole, ArtifactType, Stage
 from .base import BaseAgent
 
 
 class ResearcherAgent(BaseAgent):
     role = AgentRole.RESEARCHER
-    default_provider = LLMProvider.CLAUDE
-    default_model = "claude-sonnet-4-20250514"
 
     def system_prompt(self, stage: Stage) -> str:
         base = (

@@ -198,7 +198,8 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
     ver = state.current_version()
     print(f"┌─ v{ver} Dispatching: {role.value} agent")
     eff = dispatcher.effort.get(role, 'high')
-    print(f"│  Stage: {stage.value} | Model: {dispatcher.models.get(role, '?')} | Effort: {eff}")
+    backend = dispatcher.backends.get(role, "claude")
+    print(f"│  Stage: {stage.value} | CLI: {backend.value} | Model: {dispatcher.models.get(role, '?')} | Effort: {eff}")
     print(f"│  Tools: {dispatcher._get_toolset(role)}")
     print(f"└─ Running...")
     print()
@@ -255,7 +256,9 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     task = build_task_card(state, stage, AgentRole.CRITIC, project_id,
                            f"Review {stage.value} artifacts for scientific rigor.")
 
-    print(f"┌─ v{ver} Codex Critic (gpt-5.4 xhigh)")
+    critic_backend = dispatcher.backends.get(AgentRole.CRITIC, "codex")
+    critic_model = dispatcher.models.get(AgentRole.CRITIC, "gpt-5.4")
+    print(f"┌─ v{ver} Critic ({critic_backend.value}/{critic_model})")
     print(f"└─ Reviewing {stage.value}...")
     print()
 
@@ -541,8 +544,11 @@ def show_status(sm, project_id):
         gs = f" [{gates[-1].status.value}]" if gates else ""
         print(f"{icon} v{i}.x {s.value:<23s} agent={role:<12s} artifacts={arts}{gs}")
 
+    config = load_config()
+    critic_cfg = config.get("agents", {}).get("critic", {})
+    critic_label = f"{critic_cfg.get('backend', 'codex')}/{critic_cfg.get('model', 'gpt-5.4')}"
     print(f"\n  Version: v{state.current_version()} | Cost: ${state.total_cost():.4f}")
-    print(f"  Events:  {len(state.timeline)} | Critic: Codex gpt-5.4 xhigh")
+    print(f"  Events:  {len(state.timeline)} | Critic: {critic_label}")
     print()
 
 
