@@ -115,11 +115,16 @@ def build_task_card(state, stage, role, project_id, instruction="", previous_fee
     task_id = f"{stage.value}-{uuid.uuid4().hex[:6]}"
     artifact_dir = f"projects/{project_id}/artifacts/{stage.value}"
 
+    # Only include LATEST version of each artifact type (avoid confusing Critic with history)
     context_files = []
+    seen_types = set()
     stage_idx = STAGE_ORDER.index(stage)
     for s in STAGE_ORDER[:stage_idx + 1]:
-        for a in state.stage_artifacts(s):
-            context_files.append(f"projects/{project_id}/{a.path}")
+        for atype in STAGE_REQUIRED_ARTIFACTS.get(s, []):
+            latest = state.latest_artifact(atype)
+            if latest and atype.value not in seen_types:
+                context_files.append(f"projects/{project_id}/{latest.path}")
+                seen_types.add(atype.value)
 
     required_outputs = []
     for atype in STAGE_REQUIRED_ARTIFACTS.get(stage, []):
@@ -199,8 +204,21 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
 
     result = dispatcher.dispatch(task)
 
+    # Handle auth errors — pause and let user fix
+    if result.is_auth_error:
+        print(f"  ✗ AUTH ERROR: API returned 403 or login required.")
+        print(f"  ✗ Please run:  /login  or  claude login")
+        print(f"  ✗ Then re-run the pipeline command.")
+        state = sm.load_project(project_id)
+        state.record_event(VersionEventType.GATE_FAILED,
+            f"Auth error — pipeline paused (retried {result.retries}x)",
+            agent=role, detail=result.output_text[:500])
+        sm.save_project(state)
+        return result, "Auth error — paused"
+
     icon = "✓" if result.success else "✗"
-    print(f"┌─ {icon} v{ver} Agent done ({result.duration_seconds:.1f}s)")
+    retry_str = f" (retried {result.retries}x)" if result.retries > 0 else ""
+    print(f"┌─ {icon} v{ver} Agent done ({result.duration_seconds:.1f}s){retry_str}")
     print(f"│  Files: {result.output_files}")
     print(f"└─")
     print()
@@ -242,11 +260,38 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
 
     result = dispatcher.dispatch(task)
 
+    # Handle auth/network errors from Codex
+    if result.is_auth_error or (not result.success and not result.output_text.strip()):
+        retry_str = f" (retried {result.retries}x)" if result.retries else ""
+        print(f"  ✗ Codex review failed{retry_str}: {result.error or 'no output'}")
+        print(f"  ✗ Check: codex login  or network connection")
+        state = sm.load_project(project_id)
+        state.record_event(VersionEventType.GATE_FAILED,
+            f"Codex unavailable — review skipped{retry_str}",
+            agent=AgentRole.CRITIC, detail=result.output_text[:500])
+        gate_result = GateResult(
+            gate_name=f"{stage.value}_codex_review", stage=stage,
+            status=GateStatus.FAILED,
+            checks=[GateCheck(name="codex_error", description="Codex unreachable",
+                check_type="codex", passed=False, feedback=f"Network/auth error{retry_str}")],
+            reviewer=AgentRole.CRITIC,
+            overall_feedback=f"Codex review failed (network/auth). Re-run when connection is restored.",
+            iteration=state.iteration_count.get(stage.value, 1),
+        )
+        state.gate_results.append(gate_result)
+        sm.save_project(state)
+        return result, gate_result
+
     verdict = "REVISE"
+    upper_out = result.output_text.upper()
     if result.success:
         verdict = "PASS"
-    elif "FAIL" in result.output_text.upper():
+    elif "VERDICT: PASS" in upper_out or "VERDICT:PASS" in upper_out:
+        verdict = "PASS"
+    elif any(v in upper_out for v in ["VERDICT: FAIL", "VERDICT:FAIL", "VERDICT: REJECT", "VERDICT:REJECT"]):
         verdict = "FAIL"
+    elif any(v in upper_out for v in ["VERDICT: REVISE", "VERDICT:REVISE"]):
+        verdict = "REVISE"
 
     gate_result = GateResult(
         gate_name=f"{stage.value}_codex_review",
@@ -312,9 +357,26 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
 
         for rev in range(max_revisions + 1):
             result, _ = run_step(sm, dispatcher, project_id, instruction, auto_mode=True)
+
+            # Auth error → stop entire auto pipeline, let user fix
+            if result.is_auth_error:
+                print(f"\n  ✗ Pipeline paused: authentication error.")
+                print(f"  ✗ Fix with: /login  or  claude login")
+                print(f"  ✗ Then resume: python scripts/multi_agent.py auto")
+                return
+
             if not result.success and not result.output_files:
                 continue
-            _, gate_result = run_review(sm, dispatcher, project_id, auto_mode=True)
+
+            codex_result, gate_result = run_review(sm, dispatcher, project_id, auto_mode=True)
+
+            # Codex auth error → stop
+            if codex_result.is_auth_error:
+                print(f"\n  ✗ Pipeline paused: Codex authentication error.")
+                print(f"  ✗ Fix with: codex login")
+                print(f"  ✗ Then resume: python scripts/multi_agent.py auto")
+                return
+
             if gate_result and gate_result.status == GateStatus.PASSED:
                 break
             if rev < max_revisions:
@@ -326,7 +388,8 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
         latest = gates[-1] if gates else None
 
         if latest and latest.status != GateStatus.PASSED:
-            print(f"\n  Gate not passed. Stopping for manual intervention.")
+            print(f"\n  ✗ Gate not passed for {stage.value}.")
+            print(f"  ✗ Fix issues, then resume: python scripts/multi_agent.py auto")
             break
 
         if stage in human_gates:

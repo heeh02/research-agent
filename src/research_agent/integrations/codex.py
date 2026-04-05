@@ -104,7 +104,12 @@ RULES:
 - Distinguish blocking issues (must fix) from suggestions (nice to have)
 - NEVER rewrite content — only critique and suggest directions
 - When rejecting, explain exactly what would make it pass
+- Your verdict MUST be one of: PASS, REVISE, or FAIL (not REJECT or other words)
+- PASS: all criteria >= 0.7, no blocking issues
+- REVISE: fixable issues, re-submit after addressing
+- FAIL: fundamental problems requiring major rework
 - Output valid YAML wrapped in ```yaml ... ``` fences
+- You are reviewing ONLY the latest version of each artifact, not the full history
 
 STAGE: {stage}
 
@@ -115,7 +120,7 @@ STAGE: {stage}
 PROJECT CONTEXT:
 {project_context}
 
-ARTIFACTS TO REVIEW:
+ARTIFACT TO REVIEW (latest version only):
 {artifact_content}
 
 ---
@@ -135,11 +140,24 @@ def parse_codex_review(raw_output: str) -> CodexReviewResult:
         try:
             data = yaml.safe_load(yaml_match.group(1))
             if isinstance(data, dict):
-                result.verdict = str(data.get("verdict", "REVISE")).upper()
-                result.scores = {
-                    k: float(v) for k, v in data.get("scores", {}).items()
-                    if isinstance(v, (int, float))
-                }
+                raw_verdict = str(data.get("verdict", "REVISE")).upper()
+                # Normalize non-standard verdicts
+                if raw_verdict in ("REJECT", "MAJOR_REVISION"):
+                    raw_verdict = "FAIL"
+                elif raw_verdict in ("MINOR_REVISION", "CONDITIONAL_ACCEPT"):
+                    raw_verdict = "REVISE"
+                elif raw_verdict in ("ACCEPT",):
+                    raw_verdict = "PASS"
+                result.verdict = raw_verdict
+
+                # Handle nested score dicts like {score: 0.8, justification: "..."}
+                raw_scores = data.get("scores", {})
+                result.scores = {}
+                for k, v in raw_scores.items():
+                    if isinstance(v, (int, float)):
+                        result.scores[k] = float(v)
+                    elif isinstance(v, dict) and "score" in v:
+                        result.scores[k] = float(v["score"])
                 result.blocking_issues = [
                     str(i) for i in data.get("blocking_issues", [])
                 ]
