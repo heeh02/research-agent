@@ -35,6 +35,43 @@ from .dispatcher import MultiAgentDispatcher, TaskCard, AgentResult
 # Pipeline Runner — executes pipeline operations in background threads
 # ---------------------------------------------------------------------------
 
+# Stage-specific YAML format specs (keeps CLAUDE.md short, only current stage sent)
+_STAGE_YAML_FORMATS = {
+    Stage.PROBLEM_DEFINITION: (
+        "Output format (YAML in ```yaml fences):\n"
+        "  domain, problem_statement, motivation, scope,\n"
+        "  existing_approaches: [{name, description, key_paper}] (5+),\n"
+        "  limitations_of_existing: [] (3+),\n"
+        "  proposed_direction, success_criteria,\n"
+        "  key_references: [{title, authors, year, venue, relevance}] (7+)"
+    ),
+    Stage.LITERATURE_REVIEW: (
+        "Output format (YAML in ```yaml fences):\n"
+        "  research_question, search_scope,\n"
+        "  papers: [{title, authors, year, venue, method, key_results, limitations, relevance_score}] (10+),\n"
+        "  method_taxonomy: {category: [methods]},\n"
+        "  identified_gaps: [] (3+), conflicting_findings, trend_analysis,\n"
+        "  recommended_baselines: [] (3+)"
+    ),
+    Stage.HYPOTHESIS_FORMATION: (
+        "Output format (YAML in ```yaml fences):\n"
+        "  claim, motivation, why_now, novelty_argument,\n"
+        "  key_assumptions: [] (3+), testable_predictions: [] (3+),\n"
+        "  baseline_comparison, expected_improvement (quantitative),\n"
+        "  key_risks: [{risk, likelihood, mitigation}] (3+),\n"
+        "  kill_criteria: [] (3+), minimum_viable_experiment, estimated_compute_budget"
+    ),
+    Stage.ANALYSIS: (
+        "Output format (YAML in ```yaml fences):\n"
+        "  hypothesis_recap, experiments_run,\n"
+        "  key_results: [{experiment, metric, value, baseline_value, improvement}],\n"
+        "  statistical_significance, ablation_findings,\n"
+        "  claims_supported, claims_not_supported,\n"
+        "  alternative_explanations, limitations (2+), future_work, conclusion"
+    ),
+}
+
+
 class PipelineRunner:
     """Runs pipeline operations in background threads, exposes status via API."""
 
@@ -185,15 +222,18 @@ class PipelineRunner:
     @staticmethod
     def _default_instr(stage, state):
         q = state.research_question or "the research question"
-        return {
+        # Include YAML format spec per stage (keeps CLAUDE.md short)
+        fmt = _STAGE_YAML_FORMATS.get(stage, "")
+        base = {
             Stage.PROBLEM_DEFINITION: f"Define the research problem for: {q}. Include 5+ references.",
-            Stage.LITERATURE_REVIEW: "Thorough literature review. Read problem_brief. Find papers, gaps, baselines.",
+            Stage.LITERATURE_REVIEW: "Thorough literature review. Read problem_brief. Find 10+ papers, gaps, baselines.",
             Stage.HYPOTHESIS_FORMATION: "Formulate testable hypothesis. Kill criteria are critical.",
             Stage.EXPERIMENT_DESIGN: "Design complete experiment. Read hypothesis_card. Baselines + ablations.",
             Stage.IMPLEMENTATION: "Implement experiment per spec. Single command, reproducible, with tests.",
             Stage.EXPERIMENTATION: "Verify experiment ready. Smoke test must pass.",
             Stage.ANALYSIS: "Analyze results. Cite specific experiments for every claim.",
         }.get(stage, "Proceed.")
+        return f"{base}\n\n{fmt}" if fmt else base
 
     def _do_step(self, instruction="") -> AgentResult:
         pid = self.project_id
@@ -215,7 +255,7 @@ class PipelineRunner:
         self.log(f"│  {stage.value} | {backend.value} | {d.models.get(role, '?')}")
         self.log(f"└─ Running...")
 
-        result = d.dispatch(task, progress_fn=self.log)
+        result = d.dispatch(task, progress_fn=self.log, cancel_event=self._stop)
 
         if result.is_auth_error:
             self.log(f"AUTH ERROR — pipeline paused. Fix credentials and retry.")

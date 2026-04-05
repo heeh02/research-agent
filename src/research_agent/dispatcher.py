@@ -185,11 +185,12 @@ class MultiAgentDispatcher:
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ORCHESTRATOR]),
         }
 
-    def dispatch(self, task: TaskCard, progress_fn=None) -> AgentResult:
+    def dispatch(self, task: TaskCard, progress_fn=None, cancel_event=None) -> AgentResult:
         """Dispatch task to the appropriate CLI backend with retry.
 
         Args:
-            progress_fn: Optional callback(str) for progress messages (heartbeat, file detected, etc.)
+            progress_fn: Optional callback(str) for progress messages.
+            cancel_event: Optional threading.Event — when set, abort immediately.
         """
         role = task.role
         backend = self.backends.get(role, CLIBackend.CLAUDE)
@@ -224,6 +225,7 @@ class MultiAgentDispatcher:
                         prompt, model, effort,
                         expected_files=task.required_outputs,
                         progress_fn=progress_fn,
+                        cancel_event=cancel_event,
                     )
                 else:
                     output, exit_code = self._run_claude(prompt, toolset, model, effort)
@@ -373,6 +375,7 @@ class MultiAgentDispatcher:
                       effort: str = "high",
                       expected_files: list[str] | None = None,
                       progress_fn=None,
+                      cancel_event=None,
                       ) -> tuple[str, int]:
         """Run opencode run with a prompt. Returns (output, exit_code).
 
@@ -430,6 +433,11 @@ class MultiAgentDispatcher:
 
         while time.time() - start_t < timeout:
             elapsed = int(time.time() - start_t)
+
+            # Cancelled by user?
+            if cancel_event and cancel_event.is_set():
+                _log(f"  Cancelled by user ({elapsed}s)")
+                break
 
             # Process exited?
             if proc.poll() is not None:
