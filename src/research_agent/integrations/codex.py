@@ -54,6 +54,10 @@ def run_codex_exec(
     if model:
         cmd.extend(["--model", model])
 
+    # Pass reasoning effort to codex
+    if effort and effort != "none":
+        cmd.extend(["--reasoning-effort", effort])
+
     if json_output:
         cmd.append("--json")
 

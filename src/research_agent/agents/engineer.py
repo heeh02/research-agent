@@ -38,7 +38,11 @@ class EngineerAgent(BaseAgent):
         return template.format(context=context, instruction=instruction)
 
     def expected_output_type(self, stage: Stage) -> Optional[ArtifactType]:
-        return _STAGE_OUTPUT_TYPES.get(stage)
+        types = _STAGE_OUTPUT_TYPES.get(stage, [])
+        return types[0] if types else None
+
+    def expected_output_types(self, stage: Stage) -> list[ArtifactType]:
+        return _STAGE_OUTPUT_TYPES.get(stage, [])
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +97,11 @@ _STAGE_SYSTEM_PROMPTS: dict[Stage, str] = {
 }
 
 
-_STAGE_OUTPUT_TYPES: dict[Stage, ArtifactType] = {
-    Stage.EXPERIMENT_DESIGN: ArtifactType.EXPERIMENT_SPEC,
-    Stage.IMPLEMENTATION: ArtifactType.CODE,
-    Stage.EXPERIMENTATION: ArtifactType.EXPERIMENT_LOG,
+# Each stage can produce MULTIPLE artifact types
+_STAGE_OUTPUT_TYPES: dict[Stage, list[ArtifactType]] = {
+    Stage.EXPERIMENT_DESIGN: [ArtifactType.EXPERIMENT_SPEC],
+    Stage.IMPLEMENTATION: [ArtifactType.CODE, ArtifactType.TEST_RESULT],
+    Stage.EXPERIMENTATION: [ArtifactType.RUN_MANIFEST, ArtifactType.METRICS],
 }
 
 _DEFAULT_TASK_TEMPLATE = (

@@ -59,6 +59,12 @@ codex:
   fallback_to_api: true
   fallback_model: gpt-5.4
 
+# ByteDance Seedance 2.0 Pro (Volcano Engine ARK)
+bytedance:
+  api_key: "c22b4b4b-c880-4b5c-9455-d9d93e250ac5"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  model: "seedance-2.0-pro"
+
 # Cost management
 cost:
   warning_threshold: 5.0

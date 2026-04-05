@@ -42,7 +42,8 @@ class AgentRole(str, Enum):
 class LLMProvider(str, Enum):
     CLAUDE = "claude"
     OPENAI = "openai"
-    CODEX = "codex"      # OpenAI Codex CLI via codex-plugin-cc
+    CODEX = "codex"          # OpenAI Codex CLI via codex-plugin-cc
+    BYTEDANCE = "bytedance"  # ByteDance Seedance via Volcano Engine ARK
     LOCAL = "local"
 
 
@@ -317,6 +318,12 @@ class ProjectState(BaseModel):
 
     def current_iteration(self) -> int:
         return self.iteration_count.get(self.current_stage.value, 1)
+
+    def increment_iteration(self, stage: Optional[Stage] = None):
+        """Increment the iteration count for a stage (used by revision loops)."""
+        key = (stage or self.current_stage).value
+        self.iteration_count[key] = self.iteration_count.get(key, 1) + 1
+        self.updated_at = datetime.now()
 
     def record_transition(self, to_stage: Stage, trigger: str,
                           gate_result: Optional[GateResult] = None, notes: str = ""):

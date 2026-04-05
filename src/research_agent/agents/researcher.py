@@ -37,7 +37,11 @@ class ResearcherAgent(BaseAgent):
         return template.format(context=context, instruction=instruction)
 
     def expected_output_type(self, stage: Stage) -> Optional[ArtifactType]:
-        return _STAGE_OUTPUT_TYPES.get(stage)
+        types = _STAGE_OUTPUT_TYPES.get(stage, [])
+        return types[0] if types else None
+
+    def expected_output_types(self, stage: Stage) -> list[ArtifactType]:
+        return _STAGE_OUTPUT_TYPES.get(stage, [])
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +92,12 @@ _STAGE_SYSTEM_PROMPTS: dict[Stage, str] = {
 }
 
 
-_STAGE_OUTPUT_TYPES: dict[Stage, ArtifactType] = {
-    Stage.PROBLEM_DEFINITION: ArtifactType.PROBLEM_BRIEF,
-    Stage.LITERATURE_REVIEW: ArtifactType.LITERATURE_MAP,
-    Stage.HYPOTHESIS_FORMATION: ArtifactType.HYPOTHESIS_CARD,
-    Stage.ANALYSIS: ArtifactType.RESULT_REPORT,
+# Each stage can produce MULTIPLE artifact types
+_STAGE_OUTPUT_TYPES: dict[Stage, list[ArtifactType]] = {
+    Stage.PROBLEM_DEFINITION: [ArtifactType.PROBLEM_BRIEF],
+    Stage.LITERATURE_REVIEW: [ArtifactType.LITERATURE_MAP, ArtifactType.EVIDENCE_TABLE],
+    Stage.HYPOTHESIS_FORMATION: [ArtifactType.HYPOTHESIS_CARD],
+    Stage.ANALYSIS: [ArtifactType.RESULT_REPORT, ArtifactType.CLAIM_CHECKLIST],
 }
 
 _DEFAULT_TASK_TEMPLATE = (

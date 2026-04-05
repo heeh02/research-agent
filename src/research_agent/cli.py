@@ -1,23 +1,23 @@
-"""CLI interface for the research agent system.
+"""CLI interface — project state management only.
+
+Agent dispatch goes through `scripts/multi_agent.py`.
+This CLI handles: init, status, save, advance, rollback, artifacts, cost, history.
 
 Usage:
-    ra init <name>                    Create a new research project
-    ra status                         Show current project status
-    ra run [--instruction TEXT]       Run the primary agent for current stage
-    ra gate                           Evaluate the gate for current stage
-    ra advance [--approve] [--force]  Advance to next stage
-    ra rollback <stage>               Roll back to an earlier stage
-    ra loop [--instruction TEXT]      Run agent→gate→revise loop automatically
-    ra artifacts                      List all artifacts
-    ra cost                           Show cost breakdown
-    ra history                        Show project history
-    ra projects                       List all projects
-    ra use <project_id>               Switch to a different project
+    ra init <name> -q "question"     Create a new research project
+    ra status                        Show current project status
+    ra save <type> <file>           Register an artifact
+    ra advance [--approve] [--force] Advance to next stage
+    ra rollback <stage>              Roll back to an earlier stage
+    ra artifacts                     List all artifacts
+    ra cost                          Show cost breakdown
+    ra history                       Show project history
+    ra projects                      List all projects
+    ra use <project_id>              Switch to a project
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -25,22 +25,26 @@ from typing import Optional
 import click
 import yaml
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree
 
-from .models import STAGE_ORDER, Stage
-from .orchestrator import Orchestrator
+from .models import (
+    ALLOWED_TRANSITIONS,
+    STAGE_ORDER,
+    STAGE_PRIMARY_AGENT,
+    STAGE_REQUIRED_ARTIFACTS,
+    AgentRole,
+    ArtifactType,
+    GateStatus,
+    Stage,
+)
+from .state import StateManager
+from .artifacts import create_artifact, load_schema, validate_artifact_content
 
 console = Console()
 
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
 
 def _find_base_dir() -> Path:
-    """Find the project base directory (looks for config/settings.yaml)."""
-    # Check current directory first, then walk up
     cwd = Path.cwd()
     for d in [cwd] + list(cwd.parents):
         if (d / "config" / "settings.yaml").exists():
@@ -48,292 +52,225 @@ def _find_base_dir() -> Path:
     return cwd
 
 
-def _load_config(base_dir: Path) -> dict:
-    config_file = base_dir / "config" / "settings.yaml"
-    if config_file.exists():
-        return yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
-    return {}
+def _get_sm(base_dir: Optional[Path] = None) -> StateManager:
+    return StateManager(base_dir or _find_base_dir())
 
 
-def _get_orchestrator(base_dir: Optional[Path] = None) -> Orchestrator:
-    bd = base_dir or _find_base_dir()
-    config = _load_config(bd)
-    return Orchestrator(config, bd)
+def _get_active(base_dir: Path) -> Optional[str]:
+    f = base_dir / ".active_project"
+    return f.read_text(encoding="utf-8").strip() if f.exists() else None
 
 
-def _get_active_project_id(base_dir: Path) -> Optional[str]:
-    active_file = base_dir / ".active_project"
-    if active_file.exists():
-        return active_file.read_text(encoding="utf-8").strip()
-    return None
-
-
-def _set_active_project_id(base_dir: Path, project_id: str) -> None:
+def _set_active(base_dir: Path, project_id: str) -> None:
     (base_dir / ".active_project").write_text(project_id, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
-# CLI commands
+# CLI
 # ---------------------------------------------------------------------------
 
 @click.group()
-@click.option("--base-dir", type=click.Path(exists=True), default=None, help="Project base directory")
+@click.option("--base-dir", type=click.Path(exists=True), default=None)
 @click.pass_context
 def main(ctx, base_dir):
-    """Research Agent — Multi-agent automated research pipeline."""
+    """Research Agent — project state management."""
     ctx.ensure_object(dict)
     ctx.obj["base_dir"] = Path(base_dir) if base_dir else _find_base_dir()
 
 
 @main.command()
 @click.argument("name")
-@click.option("--question", "-q", prompt="Research question", help="The main research question")
-@click.option("--description", "-d", default="", help="Project description")
+@click.option("--question", "-q", prompt="Research question")
+@click.option("--description", "-d", default="")
 @click.pass_context
 def init(ctx, name, question, description):
     """Create a new research project."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    state = orch.create_project(name, description, question)
-    _set_active_project_id(ctx.obj["base_dir"], state.project_id)
-
-    console.print(Panel(
-        f"[bold green]Project created:[/] {state.name}\n"
-        f"[dim]ID:[/] {state.project_id}\n"
-        f"[dim]Question:[/] {state.research_question}\n"
-        f"[dim]Stage:[/] {state.current_stage.value}\n\n"
-        "Next: run [bold]ra run[/] to start the first stage.",
-        title="New Research Project",
-    ))
+    sm = _get_sm(ctx.obj["base_dir"])
+    state = sm.create_project(name, description, question)
+    _set_active(ctx.obj["base_dir"], state.project_id)
+    console.print(f"[green]Created:[/] {state.name} ({state.project_id})")
+    console.print(f"Next: [bold]python scripts/multi_agent.py auto[/]")
 
 
 @main.command()
 @click.pass_context
 def status(ctx):
     """Show current project status."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+    sm = _get_sm(ctx.obj["base_dir"])
+    pid = _get_active(ctx.obj["base_dir"])
+    if not pid:
+        console.print("[red]No active project. Run `ra init`.[/]")
         return
 
-    state = orch.load_project(project_id)
-    summary = orch.get_status_summary(state)
+    state = sm.load_project(pid)
+    stage = state.current_stage
+    ci = STAGE_ORDER.index(stage)
 
-    # Build stage progress tree
-    tree = Tree(f"[bold]{summary['project']}[/]")
-    current_idx = STAGE_ORDER.index(state.current_stage)
-    for i, stage in enumerate(STAGE_ORDER):
-        if i < current_idx:
-            icon = "[green]✓[/]"
-        elif i == current_idx:
-            icon = "[yellow]→[/]"
-        else:
-            icon = "[dim]○[/]"
-        # Check if there's a gate result for this stage
-        gate_info = ""
-        stage_gates = [g for g in state.gate_results if g.stage == stage]
-        if stage_gates:
-            latest = stage_gates[-1]
-            gate_info = f" [{latest.status.value}]"
-        tree.add(f"{icon} {stage.value}{gate_info}")
-
+    tree = Tree(f"[bold]{state.name}[/] v{state.current_version()}")
+    for i, s in enumerate(STAGE_ORDER):
+        icon = "[green]✓[/]" if i < ci else ("[yellow]→[/]" if i == ci else "[dim]○[/]")
+        gates = [g for g in state.gate_results if g.stage == s]
+        gs = f" [{gates[-1].status.value}]" if gates else ""
+        arts = len(state.stage_artifacts(s))
+        tree.add(f"{icon} {s.value} ({arts} artifacts){gs}")
     console.print(tree)
-    console.print()
 
-    # Summary table
     table = Table(show_header=False, box=None)
-    table.add_column("Key", style="dim")
-    table.add_column("Value")
-    table.add_row("Stage", summary["stage"])
-    table.add_row("Iteration", str(summary["iteration"]))
-    table.add_row("Artifacts", str(summary["artifacts"]))
-    table.add_row("Total Cost", summary["total_cost"])
-    table.add_row("Latest Gate", summary["latest_gate"])
+    table.add_column("K", style="dim")
+    table.add_column("V")
+    table.add_row("Stage", f"{stage.value} (iter {state.current_iteration()})")
+    table.add_row("Cost", f"${state.total_cost():.4f}")
+    table.add_row("Events", str(len(state.timeline)))
     console.print(table)
 
+    required = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+    missing = [a.value for a in required if state.latest_artifact(a) is None]
+    if missing:
+        console.print(f"\n[yellow]Missing:[/] {', '.join(missing)}")
+    else:
+        console.print(f"\n[green]All artifacts present.[/] Run review or advance.")
+
 
 @main.command()
-@click.option("--instruction", "-i", default="", help="Task instruction for the agent")
-@click.option("--agent", "-a", type=click.Choice(["researcher", "critic", "engineer"]),
-              default=None, help="Override which agent to use")
+@click.argument("type_name")
+@click.argument("file_path")
+@click.option("--force", is_flag=True)
 @click.pass_context
-def run(ctx, instruction, agent):
-    """Run the primary agent for the current stage."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+def save(ctx, type_name, file_path, force):
+    """Register an artifact file with the pipeline."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
+        console.print("[red]No active project.[/]")
         return
 
-    state = orch.load_project(project_id)
-    from .models import AgentRole
-    agent_role = AgentRole(agent) if agent else None
-
-    console.print(f"[dim]Running agent for stage: {state.current_stage.value}...[/]")
-
-    output, state = orch.run_stage(state, instruction, agent_override=agent_role)
-
-    console.print(Panel(output[:3000], title="Agent Output", border_style="blue"))
-    if len(output) > 3000:
-        console.print(f"[dim](output truncated, full output in artifacts)[/]")
-
-    # Show cost
-    if state.cost_records:
-        latest_cost = state.cost_records[-1]
-        console.print(f"[dim]Cost: ${latest_cost.cost_usd:.4f} ({latest_cost.model})[/]")
-
-
-@main.command()
-@click.pass_context
-def gate(ctx):
-    """Evaluate the gate for the current stage."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+    state = sm.load_project(pid)
+    try:
+        atype = ArtifactType(type_name)
+    except ValueError:
+        console.print(f"[red]Invalid type: {type_name}[/]")
         return
 
-    state = orch.load_project(project_id)
-    console.print(f"[dim]Evaluating gate for stage: {state.current_stage.value}...[/]")
+    src = Path(file_path)
+    if not src.exists():
+        console.print(f"[red]File not found: {src}[/]")
+        return
 
-    result = orch.run_gate(state)
+    content = src.read_text()
+    schema = load_schema(bd / "schemas", atype)
+    if schema:
+        errors = validate_artifact_content(content, schema)
+        if errors and not force:
+            for e in errors:
+                console.print(f"  [yellow]- {e}[/]")
+            console.print("Use --force to register anyway.")
+            return
 
-    # Display results
-    status_color = {
-        "passed": "green",
-        "failed": "red",
-        "human_review": "yellow",
-        "pending": "dim",
-    }.get(result.status.value, "white")
-
-    console.print(Panel(
-        f"[bold {status_color}]{result.status.value.upper()}[/]\n\n"
-        f"{result.overall_feedback}",
-        title=f"Gate: {result.gate_name}",
-        border_style=status_color,
-    ))
-
-    # Show individual checks
-    if result.checks:
-        table = Table(title="Checks")
-        table.add_column("Check", style="bold")
-        table.add_column("Status")
-        table.add_column("Score")
-        table.add_column("Feedback")
-        for check in result.checks:
-            status_icon = "[green]✓[/]" if check.passed else "[red]✗[/]"
-            score_str = f"{check.score:.2f}" if check.score is not None else "—"
-            table.add_row(check.name, status_icon, score_str, check.feedback[:80])
-        console.print(table)
+    existing = [a for a in state.artifacts if a.artifact_type == atype]
+    version = max((a.version for a in existing), default=0) + 1
+    filename = f"{atype.value}_v{version}.yaml"
+    sm.save_artifact_file(pid, state.current_stage, filename, content)
+    create_artifact(state, atype, state.current_stage, AgentRole.RESEARCHER, filename)
+    sm.save_project(state)
+    console.print(f"[green]Saved:[/] {atype.value} v{version}")
 
 
 @main.command()
-@click.option("--approve", is_flag=True, help="Approve human review gate")
-@click.option("--force", is_flag=True, help="Force advance without gate check")
+@click.option("--approve", is_flag=True)
+@click.option("--force", is_flag=True)
 @click.pass_context
 def advance(ctx, approve, force):
     """Advance to the next stage."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
+        console.print("[red]No active project.[/]")
         return
 
-    state = orch.load_project(project_id)
+    state = sm.load_project(pid)
+    stage = state.current_stage
+    idx = STAGE_ORDER.index(stage)
 
-    if approve:
-        # Mark the latest human_review gate as passed
-        stage_gates = [g for g in state.gate_results if g.stage == state.current_stage]
-        if stage_gates and stage_gates[-1].status.value == "human_review":
-            stage_gates[-1].status = __import__(
-                "research_agent.models", fromlist=["GateStatus"]
-            ).GateStatus.PASSED
-            orch.state_mgr.save_project(state)
+    if idx >= len(STAGE_ORDER) - 1:
+        console.print("Already at final stage.")
+        return
 
-    success, message = orch.advance(state, force=force)
-    if success:
-        console.print(f"[green]{message}[/]")
-    else:
-        console.print(f"[red]{message}[/]")
+    gates = [g for g in state.gate_results if g.stage == stage]
+    if not gates and not force:
+        console.print("[red]No gate result. Run review first.[/]")
+        return
+
+    if gates:
+        latest = gates[-1]
+        if latest.status == GateStatus.FAILED and not force:
+            console.print(f"[red]Gate FAILED.[/] {latest.overall_feedback[:200]}")
+            return
+        if latest.status == GateStatus.HUMAN_REVIEW and not approve:
+            console.print("[yellow]Human approval required. Use --approve.[/]")
+            return
+        if latest.status == GateStatus.HUMAN_REVIEW and approve:
+            latest.status = GateStatus.PASSED
+            sm.save_project(state)
+
+    nxt = STAGE_ORDER[idx + 1]
+    trigger = ALLOWED_TRANSITIONS.get((stage, nxt), "manual_advance")
+    state.record_transition(nxt, trigger)
+    sm.save_project(state)
+    console.print(f"[green]Advanced → {nxt.value}[/] (v{state.current_version()})")
 
 
 @main.command()
 @click.argument("target_stage")
-@click.option("--reason", "-r", default="", help="Reason for rollback")
+@click.option("--reason", "-r", default="")
 @click.pass_context
 def rollback(ctx, target_stage, reason):
     """Roll back to an earlier stage."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
+        console.print("[red]No active project.[/]")
         return
 
-    state = orch.load_project(project_id)
+    state = sm.load_project(pid)
     try:
         target = Stage(target_stage)
     except ValueError:
         console.print(f"[red]Invalid stage: {target_stage}[/]")
-        console.print(f"Valid stages: {', '.join(s.value for s in Stage)}")
         return
 
-    success, message = orch.rollback(state, target, reason)
-    if success:
-        console.print(f"[yellow]{message}[/]")
-    else:
-        console.print(f"[red]{message}[/]")
-
-
-@main.command()
-@click.option("--instruction", "-i", default="", help="Task instruction")
-@click.option("--max-revisions", "-n", default=3, help="Max revision cycles")
-@click.pass_context
-def loop(ctx, instruction, max_revisions):
-    """Run agent→gate→revise loop automatically until gate passes."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project. Run `ra init` first.[/]")
+    key = (state.current_stage, target)
+    if key not in ALLOWED_TRANSITIONS:
+        console.print(f"[red]Cannot rollback {state.current_stage.value} → {target.value}[/]")
         return
 
-    state = orch.load_project(project_id)
-    console.print(
-        f"[dim]Running automated loop for stage: {state.current_stage.value} "
-        f"(max {max_revisions} revisions)...[/]"
-    )
-
-    output, gate_result, state = orch.run_until_gate(state, instruction, max_revisions)
-
-    status_color = "green" if gate_result.status.value in ("passed", "human_review") else "red"
-    console.print(Panel(
-        f"[bold {status_color}]{gate_result.status.value.upper()}[/] "
-        f"after {gate_result.iteration} iteration(s)\n\n"
-        f"{gate_result.overall_feedback}",
-        title="Loop Result",
-        border_style=status_color,
-    ))
+    state.record_transition(target, ALLOWED_TRANSITIONS[key], notes=reason)
+    sm.save_project(state)
+    console.print(f"[yellow]Rolled back → {target.value}[/] (v{state.current_version()})")
 
 
 @main.command()
 @click.pass_context
 def artifacts(ctx):
-    """List all artifacts in the current project."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project.[/]")
+    """List all artifacts."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
         return
 
-    state = orch.load_project(project_id)
+    state = sm.load_project(pid)
     if not state.artifacts:
-        console.print("[dim]No artifacts yet.[/]")
+        console.print("[dim]No artifacts.[/]")
         return
 
     table = Table(title="Artifacts")
-    table.add_column("Type", style="bold")
-    table.add_column("Version")
+    table.add_column("Type")
+    table.add_column("V")
     table.add_column("Stage")
-    table.add_column("Created By")
+    table.add_column("By")
     table.add_column("Path")
     for a in state.artifacts:
         table.add_row(a.artifact_type.value, f"v{a.version}", a.stage.value,
@@ -344,69 +281,55 @@ def artifacts(ctx):
 @main.command()
 @click.pass_context
 def cost(ctx):
-    """Show cost breakdown by stage and agent."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project.[/]")
+    """Show cost breakdown."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
         return
 
-    state = orch.load_project(project_id)
+    state = sm.load_project(pid)
     if not state.cost_records:
-        console.print("[dim]No costs recorded yet.[/]")
+        console.print("[dim]No costs.[/]")
         return
 
-    # By stage
-    stage_costs: dict[str, float] = {}
-    agent_costs: dict[str, float] = {}
+    by_stage: dict[str, float] = {}
     for r in state.cost_records:
-        stage_costs[r.stage.value] = stage_costs.get(r.stage.value, 0) + r.cost_usd
-        agent_costs[r.agent.value] = agent_costs.get(r.agent.value, 0) + r.cost_usd
-
+        by_stage[r.stage.value] = by_stage.get(r.stage.value, 0) + r.cost_usd
     table = Table(title="Cost by Stage")
     table.add_column("Stage")
-    table.add_column("Cost (USD)", justify="right")
-    for stage, cost_val in sorted(stage_costs.items()):
-        table.add_row(stage, f"${cost_val:.4f}")
+    table.add_column("USD", justify="right")
+    for s, c in sorted(by_stage.items()):
+        table.add_row(s, f"${c:.4f}")
     table.add_row("[bold]Total[/]", f"[bold]${state.total_cost():.4f}[/]")
     console.print(table)
-
-    table2 = Table(title="Cost by Agent")
-    table2.add_column("Agent")
-    table2.add_column("Cost (USD)", justify="right")
-    for agent_name, cost_val in sorted(agent_costs.items()):
-        table2.add_row(agent_name, f"${cost_val:.4f}")
-    console.print(table2)
 
 
 @main.command()
 @click.pass_context
 def history(ctx):
-    """Show project transition history."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    project_id = _get_active_project_id(ctx.obj["base_dir"])
-    if not project_id:
-        console.print("[red]No active project.[/]")
+    """Show stage transitions."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    pid = _get_active(bd)
+    if not pid:
         return
 
-    state = orch.load_project(project_id)
+    state = sm.load_project(pid)
     if not state.transitions:
-        console.print("[dim]No transitions yet.[/]")
+        console.print("[dim]No transitions.[/]")
         return
 
-    table = Table(title="Stage Transitions")
+    table = Table(title="Transitions")
     table.add_column("Time")
     table.add_column("From")
     table.add_column("To")
     table.add_column("Trigger")
-    table.add_column("Notes")
     for t in state.transitions:
         table.add_row(
-            t.timestamp.strftime("%Y-%m-%d %H:%M"),
+            t.timestamp.strftime("%m-%d %H:%M"),
             t.from_stage.value if t.from_stage else "—",
-            t.to_stage.value,
-            t.trigger,
-            t.notes[:40] if t.notes else "",
+            t.to_stage.value, t.trigger,
         )
     console.print(table)
 
@@ -414,25 +337,23 @@ def history(ctx):
 @main.command()
 @click.pass_context
 def projects(ctx):
-    """List all research projects."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
-    all_projects = orch.list_projects()
-    active_id = _get_active_project_id(ctx.obj["base_dir"])
-
-    if not all_projects:
-        console.print("[dim]No projects. Run `ra init` to create one.[/]")
+    """List all projects."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
+    active = _get_active(bd)
+    all_p = sm.list_projects()
+    if not all_p:
+        console.print("[dim]No projects.[/]")
         return
 
-    table = Table(title="Research Projects")
-    table.add_column("Active")
-    table.add_column("ID", style="bold")
+    table = Table(title="Projects")
+    table.add_column("")
+    table.add_column("ID")
     table.add_column("Name")
     table.add_column("Stage")
-    table.add_column("Cost")
-    for p in all_projects:
-        active = "→" if p.project_id == active_id else ""
-        table.add_row(active, p.project_id, p.name, p.current_stage.value,
-                       f"${p.total_cost():.4f}")
+    for p in all_p:
+        table.add_row("→" if p.project_id == active else "",
+                       p.project_id, p.name, p.current_stage.value)
     console.print(table)
 
 
@@ -440,15 +361,16 @@ def projects(ctx):
 @click.argument("project_id")
 @click.pass_context
 def use(ctx, project_id):
-    """Switch to a different project."""
-    orch = _get_orchestrator(ctx.obj["base_dir"])
+    """Switch to a project."""
+    bd = ctx.obj["base_dir"]
+    sm = _get_sm(bd)
     try:
-        state = orch.load_project(project_id)
+        state = sm.load_project(project_id)
     except FileNotFoundError:
-        console.print(f"[red]Project not found: {project_id}[/]")
+        console.print(f"[red]Not found: {project_id}[/]")
         return
-    _set_active_project_id(ctx.obj["base_dir"], project_id)
-    console.print(f"[green]Switched to: {state.name} ({project_id})[/]")
+    _set_active(bd, project_id)
+    console.print(f"[green]Switched to: {state.name}[/]")
 
 
 if __name__ == "__main__":

@@ -309,6 +309,12 @@ class MultiAgentDispatcher:
         return claude_md.read_text(encoding="utf-8") if claude_md.exists() else ""
 
     def _get_toolset(self, role: AgentRole) -> str:
+        """Get allowed tools: config-driven with enum defaults."""
+        agent_cfg = self.config.get("agents", {})
+        role_cfg = agent_cfg.get(role.value, {})
+        if "allowed_tools" in role_cfg:
+            return role_cfg["allowed_tools"]
+        # Fallback to hardcoded defaults
         return {
             AgentRole.RESEARCHER: AgentToolset.RESEARCHER.value,
             AgentRole.ENGINEER: AgentToolset.ENGINEER.value,
@@ -377,23 +383,37 @@ class MultiAgentDispatcher:
         from .integrations.codex import codex_review
         from .agents.critic import STAGE_REVIEW_CRITERIA
 
-        # Build READABLE prose for Codex, not raw YAML dumps.
-        # Codex reviews better when it reads a narrative, not a schema.
+        # Two modes:
+        # 1. If artifact files exist, tell Codex to READ THEM DIRECTLY (codebase-aware)
+        # 2. Fallback: embed readable prose in the prompt
+        file_read_instructions = []
         context_parts = []
         for f in task.context_files:
             p = self.project_dir / f
             if p.exists():
+                file_read_instructions.append(f"Read and review the file: {f}")
+                # Also provide readable version as backup context
                 raw = p.read_text(encoding="utf-8")
-                context_parts.append(
-                    self._yaml_to_readable(p.name, raw)
-                )
+                context_parts.append(self._yaml_to_readable(p.name, raw))
 
         criteria = STAGE_REVIEW_CRITERIA.get(task.stage.value, "Review for rigor.")
+
+        # If Codex can read files, tell it to do so
+        if file_read_instructions:
+            extra_context = (
+                "IMPORTANT: You are running inside the project directory. "
+                "Read the artifact files directly for the most accurate review:\n"
+                + "\n".join(f"  - {inst}" for inst in file_read_instructions)
+                + "\n\nAs backup, here is a readable summary of the artifacts:\n\n"
+                + "\n\n".join(context_parts)
+            )
+        else:
+            extra_context = "\n\n".join(context_parts)
 
         start = time.time()
         result = codex_review(
             stage=task.stage.value,
-            artifact_content="\n\n".join(context_parts),
+            artifact_content=extra_context,
             review_criteria=criteria,
             project_context=task.instruction,
             model=self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4"),
@@ -433,11 +453,25 @@ class MultiAgentDispatcher:
         )
 
     def _detect_output_files(self, task: TaskCard, output: str) -> list[str]:
-        found = []
+        """Detect output files: check required paths + scan artifact dir for new files."""
+        found = set()
+        # Check expected outputs
         for expected in task.required_outputs:
             if (self.project_dir / expected).exists():
-                found.append(expected)
-        return found
+                found.add(expected)
+
+        # Also scan the stage artifact directory for any YAML files the agent wrote
+        pid = task.metadata.get("project_id", "")
+        if pid:
+            art_dir = self.project_dir / "projects" / pid / "artifacts" / task.stage.value
+            if art_dir.exists():
+                for f in art_dir.glob("*.yaml"):
+                    # Skip review files (those are from critic)
+                    if not f.name.startswith("review_"):
+                        rel = f"projects/{pid}/artifacts/{task.stage.value}/{f.name}"
+                        found.add(rel)
+
+        return list(found)
 
     def _save_full_log(self, task: TaskCard, output: str) -> Path:
         """Save the complete agent/codex output to a log file. Never truncated."""

@@ -381,7 +381,12 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
             if gate_result and gate_result.status == GateStatus.PASSED:
                 break
             if rev < max_revisions:
-                print(f"  Revision {rev+1}/{max_revisions}...\n")
+                # Increment iteration count so version number advances (v0.1 → v0.2)
+                # and max_iterations gate check works
+                state = sm.load_project(project_id)
+                state.increment_iteration()
+                sm.save_project(state)
+                print(f"  Revision {rev+1}/{max_revisions} → v{state.current_version()}...\n")
                 instruction = ""
 
         state = sm.load_project(project_id)
@@ -394,7 +399,15 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
             break
 
         if stage in human_gates:
-            print(f"\n  Human gate at {stage.value}. Run: python scripts/pipeline.py advance --approve")
+            # Persist HUMAN_REVIEW status so advance --approve is required
+            state = sm.load_project(project_id)
+            gates = [g for g in state.gate_results if g.stage == stage]
+            if gates:
+                gates[-1].status = GateStatus.HUMAN_REVIEW
+            state.record_event(VersionEventType.GATE_REVIEW,
+                f"Human gate: awaiting approval at {stage.value}")
+            sm.save_project(state)
+            print(f"\n  Human gate at {stage.value}. Run: ra advance --approve")
             break
 
         idx = STAGE_ORDER.index(stage)
