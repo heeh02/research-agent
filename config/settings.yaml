@@ -11,7 +11,6 @@ pipeline:
 
 # Agent configurations
 # backend: claude | codex | opencode
-# For opencode models, use format: provider/model (e.g. volcengine-plan/doubao-seed-2.0-pro)
 agents:
   researcher:
     backend: claude
@@ -38,14 +37,6 @@ agents:
     effort: medium
     max_turns: 10
     allowed_tools: "Read,Write,Bash,Glob,Grep"
-
-# OpenCode models reference (run: opencode models)
-# volcengine-plan/doubao-seed-2.0-pro
-# volcengine-plan/doubao-seed-2.0-lite
-# volcengine-plan/doubao-seed-2.0-code
-# volcengine-plan/deepseek-v3.2
-# volcengine-plan/kimi-k2.5
-# volcengine-plan/glm-4.7
 
 # Cost management
 cost:

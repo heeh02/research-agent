@@ -1,4 +1,11 @@
-"""Web GUI — version timeline + CLI backend selector for multi-agent pipeline.
+"""Web GUI — full pipeline control + visualization.
+
+Features:
+- Project management (create, switch, list)
+- Pipeline control (auto, step, review, approve, stop)
+- CLI backend selector (claude/codex/opencode) per agent
+- Real-time console output
+- Version timeline + detail panel
 
 Launch: python scripts/multi_agent.py gui [--port 8080]
 """
@@ -6,442 +13,816 @@ Launch: python scripts/multi_agent.py gui [--port 8080]
 from __future__ import annotations
 
 import json
+import threading
+import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 
-from .models import STAGE_ORDER, STAGE_PRIMARY_AGENT, AgentRole, CLIBackend, ProjectState, VersionEventType
+from .models import (
+    ALLOWED_TRANSITIONS, STAGE_ORDER, STAGE_PRIMARY_AGENT, STAGE_REQUIRED_ARTIFACTS,
+    AgentRole, ArtifactType, CLIBackend, GateCheck, GateResult, GateStatus,
+    ProjectState, Stage, VersionEventType,
+)
 from .state import StateManager
+from .artifacts import create_artifact
+from .dispatcher import MultiAgentDispatcher, TaskCard, AgentResult
 
-_HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Research Agent — {{PROJECT_NAME}}</title>
-<style>
-:root {
-  --bg: #0d1117; --surface: #161b22; --border: #30363d;
-  --text: #e6edf3; --text-dim: #8b949e; --text-bright: #f0f6fc;
-  --green: #3fb950; --red: #f85149; --yellow: #d29922; --blue: #58a6ff;
-  --purple: #bc8cff; --cyan: #39d2c0; --orange: #f0883e;
-}
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'SF Mono','Cascadia Code','Consolas',monospace; background: var(--bg); color: var(--text); line-height: 1.6; }
-.container { max-width: 1400px; margin: 0 auto; padding: 16px 20px; }
 
-/* Header */
-.header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px; flex-wrap: wrap; gap: 8px; }
-.header h1 { font-size: 17px; color: var(--text-bright); }
-.header-right { display: flex; gap: 14px; align-items: center; }
-.version-badge { background: var(--blue); color: var(--bg); padding: 3px 12px; border-radius: 12px; font-weight: 600; font-size: 13px; }
-.cost { color: var(--yellow); font-size: 13px; }
-.refresh-btn, .settings-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text-dim); padding: 3px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: inherit; }
-.refresh-btn:hover, .settings-btn:hover { border-color: var(--blue); color: var(--text); }
-.settings-btn.active { background: var(--blue); color: var(--bg); border-color: var(--blue); }
+# ---------------------------------------------------------------------------
+# Pipeline Runner — executes pipeline operations in background threads
+# ---------------------------------------------------------------------------
 
-/* Settings panel */
-.settings-panel { display: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
-.settings-panel.visible { display: block; }
-.settings-panel h3 { font-size: 13px; color: var(--text-bright); margin-bottom: 12px; }
-.settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
-.agent-config { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-.agent-config h4 { font-size: 12px; margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
-.agent-config .role-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.dot-researcher { background: var(--blue); }
-.dot-engineer { background: var(--green); }
-.dot-critic { background: var(--purple); }
-.dot-orchestrator { background: var(--orange); }
-.config-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.config-row label { font-size: 11px; color: var(--text-dim); min-width: 55px; }
-.config-row select, .config-row input { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 11px; font-family: inherit; flex: 1; }
-.config-row select:focus, .config-row input:focus { border-color: var(--blue); outline: none; }
-.save-btn { background: var(--green); color: var(--bg); border: none; padding: 6px 18px; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600; margin-top: 12px; }
-.save-btn:hover { opacity: .9; }
-.save-msg { font-size: 11px; color: var(--green); margin-left: 12px; display: none; }
+class PipelineRunner:
+    """Runs pipeline operations in background threads, exposes status via API."""
 
-/* Stage progress */
-.stages { display: flex; gap: 3px; margin-bottom: 16px; }
-.stage-chip { flex: 1; padding: 7px 4px; border-radius: 6px; text-align: center; font-size: 10px; background: var(--surface); border: 1px solid var(--border); cursor: pointer; transition: all .15s; }
-.stage-chip:hover { border-color: var(--blue); }
-.stage-chip.done { background: #0d2818; border-color: var(--green); color: var(--green); }
-.stage-chip.active { background: #1a1f35; border-color: var(--blue); color: var(--blue); box-shadow: 0 0 8px rgba(88,166,255,.25); }
-.stage-chip.failed { background: #2d1215; border-color: var(--red); color: var(--red); }
-.stage-chip .agent-label { display: block; font-size: 8px; color: var(--text-dim); margin-top: 1px; }
+    def __init__(self, sm: StateManager, base_dir: Path, config: dict):
+        self.sm = sm
+        self.base_dir = base_dir
+        self.config = config
+        self._dispatcher: Optional[MultiAgentDispatcher] = None
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._approval = threading.Event()
+        # Status
+        self.running = False
+        self.mode = ""          # "auto", "step", "review"
+        self.stage_label = ""
+        self.waiting_approval = False
+        self.log_lines: list[dict] = []
 
-/* Main layout */
-.main { display: grid; grid-template-columns: 260px 1fr; gap: 16px; height: calc(100vh - 160px); min-height: 400px; }
+    @property
+    def project_id(self) -> Optional[str]:
+        f = self.base_dir / ".active_project"
+        return f.read_text("utf-8").strip() if f.exists() else None
 
-/* Sidebar */
-.sidebar { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
-.sidebar h3 { padding: 10px 14px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.sidebar-scroll { flex: 1; overflow-y: auto; }
-.version-group { border-bottom: 1px solid var(--border); }
-.version-header { padding: 9px 14px; font-size: 12px; font-weight: 600; color: var(--text-bright); cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-.version-header:hover { background: rgba(88,166,255,.05); }
-.version-header.selected { background: rgba(88,166,255,.1); border-left: 3px solid var(--blue); }
-.stage-tag { font-size: 9px; padding: 1px 6px; border-radius: 4px; background: var(--border); color: var(--text-dim); white-space: nowrap; }
-.version-events { padding: 0 14px 6px; }
-.version-event { padding: 3px 0; font-size: 10px; color: var(--text-dim); display: flex; align-items: center; gap: 5px; }
-.version-event .icon { width: 14px; text-align: center; flex-shrink: 0; }
+    @project_id.setter
+    def project_id(self, pid: str):
+        (self.base_dir / ".active_project").write_text(pid, encoding="utf-8")
 
-/* Detail panel */
-.detail { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
-.detail-header { padding: 14px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
-.detail-header h2 { font-size: 15px; color: var(--text-bright); }
-.detail-scroll { flex: 1; overflow-y: auto; padding: 14px 18px; }
-.show-all-btn { background: var(--border); border: 1px solid var(--text-dim); color: var(--text); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; white-space: nowrap; }
-.show-all-btn:hover { background: var(--blue); color: var(--bg); border-color: var(--blue); }
+    def _get_dispatcher(self) -> MultiAgentDispatcher:
+        if self._dispatcher is None or id(self.config) != getattr(self, '_cfg_id', None):
+            self._dispatcher = MultiAgentDispatcher(
+                self.base_dir, self.base_dir / "agents", self.config)
+            self._cfg_id = id(self.config)
+        return self._dispatcher
 
-/* Event card */
-.event-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 10px; }
-.event-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; flex-wrap: wrap; gap: 4px; }
-.agent-badge { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 600; white-space: nowrap; }
-.agent-researcher { background: #1a2744; color: var(--blue); }
-.agent-critic { background: #2a1a2e; color: var(--purple); }
-.agent-engineer { background: #1a2e1e; color: var(--green); }
-.agent-human { background: #2e2a1a; color: var(--yellow); }
-.ev-summary { font-size: 12px; flex: 1; min-width: 0; }
-.ev-meta { font-size: 10px; color: var(--text-dim); white-space: nowrap; }
-.verdict { font-weight: 600; }
-.verdict-PASS { color: var(--green); }
-.verdict-FAIL { color: var(--red); }
-.verdict-REVISE { color: var(--yellow); }
+    def reload_config(self, config: dict):
+        self.config = config
+        self._dispatcher = None
 
-.scores { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
-.score-chip { font-size: 10px; padding: 1px 7px; border-radius: 4px; background: var(--bg); border: 1px solid var(--border); }
-.score-chip.pass { border-color: var(--green); color: var(--green); }
-.score-chip.fail { border-color: var(--red); color: var(--red); }
+    def log(self, msg: str):
+        self.log_lines.append({"t": datetime.now().strftime("%H:%M:%S"), "m": msg})
+        if len(self.log_lines) > 500:
+            self.log_lines = self.log_lines[-500:]
 
-.artifact-list { list-style: none; margin-top: 6px; }
-.artifact-list li { font-size: 10px; padding: 2px 0; color: var(--cyan); }
-.artifact-list li::before { content: "\1F4C4 "; }
+    def get_status(self) -> dict:
+        return {
+            "running": self.running, "mode": self.mode,
+            "stage": self.stage_label, "waiting_approval": self.waiting_approval,
+            "log": self.log_lines[-100:],
+        }
 
-.detail-text { font-size: 11px; white-space: pre-wrap; word-break: break-word; color: var(--text); background: var(--bg); padding: 10px; border-radius: 4px; border: 1px solid var(--border); margin-top: 8px; max-height: 200px; overflow-y: auto; cursor: pointer; transition: max-height .3s ease; }
-.detail-text.expanded { max-height: none; }
-.detail-text-toggle { font-size: 10px; color: var(--blue); cursor: pointer; margin-top: 4px; user-select: none; }
+    # --- Public actions ---
 
-.error-banner { background: #2d1215; border: 1px solid var(--red); color: var(--red); padding: 10px 16px; border-radius: 6px; margin-bottom: 12px; font-size: 12px; display: none; }
+    def create_project(self, name: str, question: str) -> str:
+        state = self.sm.create_project(name, "", question)
+        self.project_id = state.project_id
+        self.log(f"Created project: {state.name} ({state.project_id})")
+        return state.project_id
 
-.footer { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); text-align: center; font-size: 10px; color: var(--text-dim); }
+    def start_auto(self, until: str = "", max_rev: int = 3, instruction: str = ""):
+        if self.running:
+            return
+        until_stage = Stage(until) if until else None
+        self._start_thread("auto", self._run_auto, until_stage, max_rev, instruction)
 
-@media (max-width: 800px) {
-  .main { grid-template-columns: 1fr; height: auto; }
-  .sidebar, .detail { max-height: 50vh; }
-  .stages { flex-wrap: wrap; }
-  .settings-grid { grid-template-columns: 1fr; }
-}
-</style>
-</head>
-<body>
-<div class="container">
-  <div class="header">
-    <h1>{{PROJECT_NAME}}</h1>
-    <div class="header-right">
-      <span class="cost">${{TOTAL_COST}}</span>
-      <span class="version-badge">v{{CURRENT_VERSION}}</span>
-      <button class="settings-btn" id="settingsBtn" onclick="toggleSettings()">CLI Settings</button>
-      <button class="refresh-btn" onclick="location.reload()">Refresh</button>
-    </div>
-  </div>
+    def start_step(self, instruction: str = ""):
+        if self.running:
+            return
+        self._start_thread("step", self._run_step_and_review, instruction)
 
-  <!-- CLI Backend Settings Panel -->
-  <div class="settings-panel" id="settingsPanel">
-    <h3>CLI Backend Configuration</h3>
-    <div class="settings-grid" id="settingsGrid"></div>
-    <div style="display:flex;align-items:center;margin-top:12px;">
-      <button class="save-btn" onclick="saveSettings()">Save &amp; Apply</button>
-      <span class="save-msg" id="saveMsg">Saved!</span>
-    </div>
-  </div>
+    def start_review(self):
+        if self.running:
+            return
+        self._start_thread("review", self._do_review)
 
-  <div class="error-banner" id="errorBanner"></div>
-  <div class="stages" id="stages"></div>
-  <div class="main">
-    <div class="sidebar">
-      <h3>Version Timeline (<span id="eventCount">0</span> events)</h3>
-      <div class="sidebar-scroll" id="timeline"></div>
-    </div>
-    <div class="detail">
-      <div class="detail-header">
-        <h2 id="detailTitle">Select a version</h2>
-        <button class="show-all-btn" id="showAllBtn" onclick="toggleShowAll()">Show All</button>
-      </div>
-      <div class="detail-scroll" id="detailScroll">
-        <p style="color:var(--text-dim);font-size:12px;">Click a version on the left to see agent interactions.</p>
-      </div>
-    </div>
-  </div>
-  <div class="footer">Research Agent — Multi-Agent Pipeline</div>
-</div>
+    def approve(self):
+        if self.waiting_approval:
+            self._approval.set()
 
-<script>
-const DATA = {{DATA_JSON}};
-const STAGES = {{STAGES_JSON}};
-const CONFIG = {{CONFIG_JSON}};
+    def stop(self):
+        self._stop.set()
+        self._approval.set()  # unblock if waiting
 
-document.getElementById('eventCount').textContent = DATA.timeline.length;
+    def _start_thread(self, mode, target, *args):
+        self.running = True
+        self.mode = mode
+        self._stop.clear()
+        self._approval.clear()
+        self.waiting_approval = False
+        self.log_lines = []
+        self._thread = threading.Thread(target=self._safe_run, args=(target, *args), daemon=True)
+        self._thread.start()
 
-// ========================
-// Settings Panel
-// ========================
+    def _safe_run(self, target, *args):
+        try:
+            target(*args)
+        except Exception as e:
+            self.log(f"ERROR: {type(e).__name__}: {e}")
+        finally:
+            self.running = False
+            self.mode = ""
+            self.stage_label = ""
+            self.waiting_approval = False
 
-const BACKENDS = ['claude', 'codex', 'opencode'];
-const MODELS = {
-  claude: ['claude-sonnet-4-20250514','claude-opus-4-20250514','claude-haiku-4-5-20251001'],
-  codex: ['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],
-  opencode: {{OPENCODE_MODELS_JSON}},
-};
-const EFFORTS = {
-  claude: ['max','high','medium','low'],
-  codex: ['xhigh','high','medium','low'],
-  opencode: ['max','high','medium','low','minimal'],
-};
-const ROLES = ['researcher','engineer','critic','orchestrator'];
-const ROLE_COLORS = {researcher:'blue',engineer:'green',critic:'purple',orchestrator:'orange'};
+    # --- Pipeline logic (adapted from multi_agent.py) ---
 
-function buildSettings() {
-  const grid = document.getElementById('settingsGrid');
-  grid.innerHTML = '';
-  ROLES.forEach(role => {
-    const cfg = CONFIG.agents?.[role] || {};
-    const card = document.createElement('div');
-    card.className = 'agent-config';
-    card.innerHTML = `
-      <h4><span class="role-dot dot-${role}"></span>${role}</h4>
-      <div class="config-row">
-        <label>CLI</label>
-        <select id="cfg-${role}-backend" onchange="onBackendChange('${role}')">
-          ${BACKENDS.map(b => `<option value="${b}" ${cfg.backend===b?'selected':''}>${b}</option>`).join('')}
-        </select>
-      </div>
-      <div class="config-row">
-        <label>Model</label>
-        <select id="cfg-${role}-model"></select>
-      </div>
-      <div class="config-row">
-        <label>Effort</label>
-        <select id="cfg-${role}-effort"></select>
-      </div>
-    `;
-    grid.appendChild(card);
-    onBackendChange(role, cfg.model, cfg.effort);
-  });
-}
+    def _build_task(self, state, stage, role, instruction="", feedback=""):
+        pid = self.project_id
+        task_id = f"{stage.value}-{uuid.uuid4().hex[:6]}"
+        art_dir = f"projects/{pid}/artifacts/{stage.value}"
 
-function onBackendChange(role, currentModel, currentEffort) {
-  const backend = document.getElementById(`cfg-${role}-backend`).value;
-  const modelSel = document.getElementById(`cfg-${role}-model`);
-  const effortSel = document.getElementById(`cfg-${role}-effort`);
+        ctx = []
+        seen = set()
+        si = STAGE_ORDER.index(stage)
+        for s in STAGE_ORDER[:si + 1]:
+            for at in STAGE_REQUIRED_ARTIFACTS.get(s, []):
+                latest = state.latest_artifact(at)
+                if latest and at.value not in seen:
+                    ctx.append(f"projects/{pid}/{latest.path}")
+                    seen.add(at.value)
 
-  const models = MODELS[backend] || [];
-  modelSel.innerHTML = models.map(m => `<option value="${m}">${m}</option>`).join('');
-  if (currentModel && models.includes(currentModel)) modelSel.value = currentModel;
+        outputs = []
+        for at in STAGE_REQUIRED_ARTIFACTS.get(stage, []):
+            existing = [a for a in state.artifacts if a.artifact_type == at]
+            v = max((a.version for a in existing), default=0) + 1
+            outputs.append(f"{art_dir}/{at.value}_v{v}.yaml")
 
-  const efforts = EFFORTS[backend] || ['high'];
-  effortSel.innerHTML = efforts.map(e => `<option value="${e}">${e}</option>`).join('');
-  if (currentEffort && efforts.includes(currentEffort)) effortSel.value = currentEffort;
-}
+        if not instruction:
+            instruction = self._default_instr(stage, state)
 
-function toggleSettings() {
-  const panel = document.getElementById('settingsPanel');
-  const btn = document.getElementById('settingsBtn');
-  const visible = panel.classList.toggle('visible');
-  btn.classList.toggle('active', visible);
-}
+        return TaskCard(
+            task_id=task_id, role=role, stage=stage, instruction=instruction,
+            context_files=ctx, required_outputs=outputs, previous_feedback=feedback,
+            constraints=[f"Project: {state.name}", f"Question: {state.research_question}",
+                         f"Iteration: {state.iteration_count.get(stage.value, 1)}",
+                         f"Write to: {art_dir}/"],
+            metadata={"project_id": pid, "iteration": state.iteration_count.get(stage.value, 1)},
+        )
 
-function saveSettings() {
-  const settings = {};
-  ROLES.forEach(role => {
-    settings[role] = {
-      backend: document.getElementById(`cfg-${role}-backend`).value,
-      model: document.getElementById(`cfg-${role}-model`).value,
-      effort: document.getElementById(`cfg-${role}-effort`).value,
-    };
-  });
-  fetch('/api/config', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(settings),
-  }).then(r => r.json()).then(d => {
-    const msg = document.getElementById('saveMsg');
-    msg.style.display = 'inline';
-    msg.textContent = d.ok ? 'Saved! Restart pipeline to apply.' : 'Error: ' + d.error;
-    setTimeout(() => msg.style.display = 'none', 3000);
-  }).catch(e => {
-    const msg = document.getElementById('saveMsg');
-    msg.style.display = 'inline';
-    msg.textContent = 'Network error';
-    setTimeout(() => msg.style.display = 'none', 3000);
-  });
-}
+    @staticmethod
+    def _default_instr(stage, state):
+        q = state.research_question or "the research question"
+        return {
+            Stage.PROBLEM_DEFINITION: f"Define the research problem for: {q}. Include 5+ references.",
+            Stage.LITERATURE_REVIEW: "Thorough literature review. Read problem_brief. Find papers, gaps, baselines.",
+            Stage.HYPOTHESIS_FORMATION: "Formulate testable hypothesis. Kill criteria are critical.",
+            Stage.EXPERIMENT_DESIGN: "Design complete experiment. Read hypothesis_card. Baselines + ablations.",
+            Stage.IMPLEMENTATION: "Implement experiment per spec. Single command, reproducible, with tests.",
+            Stage.EXPERIMENTATION: "Verify experiment ready. Smoke test must pass.",
+            Stage.ANALYSIS: "Analyze results. Cite specific experiments for every claim.",
+        }.get(stage, "Proceed.")
 
-buildSettings();
+    def _do_step(self, instruction="") -> AgentResult:
+        pid = self.project_id
+        state = self.sm.load_project(pid)
+        stage = state.current_stage
+        role = STAGE_PRIMARY_AGENT[stage]
+        d = self._get_dispatcher()
+        self.stage_label = stage.value
 
-// ========================
-// Stages
-// ========================
-const stagesEl = document.getElementById('stages');
-STAGES.forEach(s => {
-  const d = document.createElement('div');
-  d.className = 'stage-chip ' + s.status;
-  const backend = CONFIG.agents?.[s.agent]?.backend || 'claude';
-  d.innerHTML = `v${s.index}.x ${s.name.replace(/_/g,' ')}<span class="agent-label">${s.agent} (${backend})</span>`;
-  stagesEl.appendChild(d);
-});
+        fb = ""
+        gates = [g for g in state.gate_results if g.stage == stage]
+        if gates and gates[-1].status == GateStatus.FAILED:
+            fb = gates[-1].overall_feedback
 
-// ========================
-// Timeline
-// ========================
-const versions = {};
-DATA.timeline.forEach(ev => {
-  if (!versions[ev.version]) versions[ev.version] = { events: [], stage: ev.stage };
-  versions[ev.version].events.push(ev);
-});
+        task = self._build_task(state, stage, role, instruction, fb)
 
-const timelineEl = document.getElementById('timeline');
-const sortedVers = Object.keys(versions).sort((a,b) => {
-  const [ma,ia] = a.split('.').map(Number);
-  const [mb,ib] = b.split('.').map(Number);
-  return ma !== mb ? ma - mb : ia - ib;
-});
+        backend = d.backends.get(role, CLIBackend.CLAUDE)
+        self.log(f"┌─ v{state.current_version()} {role.value} agent")
+        self.log(f"│  {stage.value} | {backend.value} | {d.models.get(role, '?')}")
+        self.log(f"└─ Running...")
 
-const icons = { agent_run:'\u25B6', gate_review:'\u25C6', gate_passed:'\u2713', gate_failed:'\u2717',
-  stage_advance:'\u23E9', stage_rollback:'\u21A9', human_approve:'\uD83D\uDC64', human_reject:'\u270B', human_feedback:'\uD83D\uDCAC' };
-const colors = { agent_run:'var(--blue)', gate_passed:'var(--green)', gate_failed:'var(--red)',
-  stage_advance:'var(--cyan)', stage_rollback:'var(--orange)', human_approve:'var(--green)',
-  human_reject:'var(--red)', human_feedback:'var(--yellow)' };
+        result = d.dispatch(task)
 
-sortedVers.forEach(ver => {
-  const g = versions[ver];
-  const hasPass = g.events.some(e => e.event_type === 'gate_passed');
-  const hasFail = g.events.some(e => e.event_type === 'gate_failed');
-  const div = document.createElement('div');
-  div.className = 'version-group';
-  div.innerHTML = `
-    <div class="version-header" data-ver="${ver}" onclick="selectVersion('${ver}',this)">
-      <span>v${ver} ${hasPass?'\u2713':hasFail?'\u2717':''}</span>
-      <span class="stage-tag">${g.stage.replace(/_/g,' ')}</span>
-    </div>
-    <div class="version-events">${g.events.map(e => `
-      <div class="version-event">
-        <span class="icon" style="color:${colors[e.event_type]||'var(--text-dim)'}">${icons[e.event_type]||'\u00B7'}</span>
-        <span>${e.summary.substring(0,48)}</span>
-      </div>`).join('')}
-    </div>`;
-  timelineEl.appendChild(div);
-});
+        if result.is_auth_error:
+            self.log(f"AUTH ERROR — pipeline paused. Fix credentials and retry.")
+            return result
 
-let detailToggleId = 0;
+        icon = "✓" if result.success else "✗"
+        retry = f" (retried {result.retries}x)" if result.retries else ""
+        self.log(f"┌─ {icon} Done ({result.duration_seconds:.1f}s){retry}")
+        self.log(f"└─ Files: {result.output_files}")
 
-function selectVersion(ver, el) {
-  document.querySelectorAll('.version-header').forEach(h => h.classList.remove('selected'));
-  if (el) el.classList.add('selected');
+        state = self.sm.load_project(pid)
+        state.record_event(
+            VersionEventType.AGENT_RUN,
+            f"{role.value} → {stage.value}",
+            agent=role, artifacts_produced=result.output_files,
+            cost_usd=result.cost_usd, duration_seconds=result.duration_seconds,
+            detail=result.output_text,
+        )
+        for p in result.output_files:
+            for at in ArtifactType:
+                if at.value in Path(p).stem:
+                    create_artifact(state, at, stage, role, Path(p).name)
+                    break
+        self.sm.save_project(state)
+        return result
 
-  const events = versions[ver]?.events || [];
-  document.getElementById('detailTitle').textContent = `Version ${ver} \u2014 ${(events[0]?.stage||'').replace(/_/g,' ')}`;
-  const scroll = document.getElementById('detailScroll');
-  scroll.innerHTML = '';
+    def _do_review(self) -> Optional[GateResult]:
+        pid = self.project_id
+        state = self.sm.load_project(pid)
+        stage = state.current_stage
+        d = self._get_dispatcher()
+        self.stage_label = stage.value
 
-  events.forEach(ev => {
-    const card = document.createElement('div');
-    card.className = 'event-card';
+        task = self._build_task(state, stage, AgentRole.CRITIC, f"Review {stage.value} artifacts.")
 
-    const agentCls = ev.agent ? 'agent-'+ev.agent : '';
-    const verdictCls = ev.gate_verdict ? 'verdict-'+ev.gate_verdict : '';
-    const costStr = ev.cost_usd > 0 ? ` \u00B7 $${ev.cost_usd.toFixed(3)}` : '';
-    const durStr = ev.duration_seconds > 0 ? ` \u00B7 ${ev.duration_seconds.toFixed(1)}s` : '';
+        cb = d.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
+        self.log(f"┌─ v{state.current_version()} Critic ({cb.value}/{d.models.get(AgentRole.CRITIC, '?')})")
+        self.log(f"└─ Reviewing {stage.value}...")
 
-    let html = `<div class="event-header">
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-        ${ev.agent ? `<span class="agent-badge ${agentCls}">${ev.agent}</span>` : ''}
-        <span class="ev-summary">${ev.summary}</span>
-        ${ev.gate_verdict ? `<span class="verdict ${verdictCls}">${ev.gate_verdict}</span>` : ''}
-      </div>
-      <span class="ev-meta">${ev.timestamp.substring(11,19)}${costStr}${durStr}</span>
-    </div>`;
+        result = d.dispatch(task)
 
-    if (ev.scores && Object.keys(ev.scores).length) {
-      html += '<div class="scores">' + Object.entries(ev.scores).map(([k,v]) =>
-        `<span class="score-chip ${v>=0.7?'pass':'fail'}">${k}: ${v}</span>`).join('') + '</div>';
-    }
+        if result.is_auth_error or (not result.success and not result.output_text.strip()):
+            self.log(f"Critic failed: {result.error or 'no output'}")
+            state = self.sm.load_project(pid)
+            gr = GateResult(
+                gate_name=f"{stage.value}_review", stage=stage, status=GateStatus.FAILED,
+                checks=[GateCheck(name="error", description="Critic unreachable",
+                                  check_type="codex", passed=False, feedback="Network/auth error")],
+                reviewer=AgentRole.CRITIC,
+                overall_feedback="Critic review failed. Re-run when connection is restored.",
+                iteration=state.iteration_count.get(stage.value, 1),
+            )
+            state.gate_results.append(gr)
+            state.record_event(VersionEventType.GATE_FAILED, "Critic unavailable",
+                               agent=AgentRole.CRITIC, detail=result.output_text[:500])
+            self.sm.save_project(state)
+            return gr
 
-    const arts = [...(ev.artifacts_produced||[]),...(ev.artifacts_reviewed||[])];
-    if (arts.length) {
-      html += '<ul class="artifact-list">' + arts.map(a => `<li>${a.split('/').pop()}</li>`).join('') + '</ul>';
-    }
+        upper = result.output_text.upper()
+        verdict = "REVISE"
+        if result.success:
+            verdict = "PASS"
+        elif "VERDICT: PASS" in upper or "VERDICT:PASS" in upper:
+            verdict = "PASS"
+        elif any(v in upper for v in ["VERDICT: FAIL", "VERDICT:FAIL", "VERDICT: REJECT"]):
+            verdict = "FAIL"
 
-    if (ev.detail) {
-      const tid = 'dt' + (++detailToggleId);
-      const escaped = ev.detail.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-      const isLong = ev.detail.length > 500;
-      html += `<div class="detail-text${isLong?'':' expanded'}" id="${tid}" onclick="this.classList.toggle('expanded')">${escaped}</div>`;
-      if (isLong) html += `<div class="detail-text-toggle" onclick="document.getElementById('${tid}').classList.toggle('expanded');this.textContent=this.textContent==='Show more'?'Show less':'Show more'">Show more</div>`;
-    }
+        gr = GateResult(
+            gate_name=f"{stage.value}_review", stage=stage,
+            status=GateStatus.PASSED if verdict == "PASS" else GateStatus.FAILED,
+            checks=[GateCheck(name="review", description="Adversarial review",
+                              check_type="codex", passed=verdict == "PASS",
+                              feedback=result.output_text)],
+            reviewer=AgentRole.CRITIC,
+            overall_feedback=result.output_text,
+            iteration=state.iteration_count.get(stage.value, 1),
+        )
 
-    card.innerHTML = html;
-    scroll.appendChild(card);
-  });
-}
+        state = self.sm.load_project(pid)
+        state.gate_results.append(gr)
+        evt = VersionEventType.GATE_PASSED if verdict == "PASS" else VersionEventType.GATE_FAILED
+        state.record_event(evt, f"Critic: {verdict}", agent=AgentRole.CRITIC,
+                           gate_verdict=verdict, duration_seconds=result.duration_seconds,
+                           detail=result.output_text)
+        self.sm.save_project(state)
 
-let allExpanded = false;
-function toggleShowAll() {
-  allExpanded = !allExpanded;
-  document.querySelectorAll('.detail-text').forEach(el => {
-    if (allExpanded) el.classList.add('expanded');
-    else el.classList.remove('expanded');
-  });
-  document.querySelectorAll('.detail-text-toggle').forEach(el => {
-    el.textContent = allExpanded ? 'Show less' : 'Show more';
-  });
-  document.getElementById('showAllBtn').textContent = allExpanded ? 'Collapse All' : 'Show All';
-}
+        icon = "✓" if verdict == "PASS" else "✗"
+        self.log(f"  {icon} Critic: {verdict} ({result.duration_seconds:.1f}s)")
+        return gr
 
-if (sortedVers.length) {
-  const last = sortedVers[sortedVers.length-1];
-  const el = document.querySelector(`.version-header[data-ver="${last}"]`);
-  if (el) selectVersion(last, el);
-}
+    def _run_step_and_review(self, instruction=""):
+        """Run one step + review (step mode)."""
+        result = self._do_step(instruction)
+        if not result.success and not result.output_files:
+            self.log("Agent produced no output.")
+            return
+        self._do_review()
 
-setInterval(() => {
-  fetch('/api/state').then(r => r.json()).then(d => {
-    if (d.timeline.length !== DATA.timeline.length) location.reload();
-  }).catch(() => {});
-}, 10000);
-</script>
-</body>
-</html>"""
+    def _run_auto(self, until_stage, max_rev, instruction):
+        """Full auto mode."""
+        pid = self.project_id
+        human_gates = [Stage(s) for s in
+                       self.config.get("pipeline", {}).get("human_gates",
+                       ["hypothesis_formation", "experimentation"])]
 
+        while not self._stop.is_set():
+            state = self.sm.load_project(pid)
+            stage = state.current_stage
+
+            if until_stage and STAGE_ORDER.index(stage) > STAGE_ORDER.index(until_stage):
+                self.log(f"Reached {until_stage.value}. Stopping.")
+                break
+            if stage == STAGE_ORDER[-1]:
+                gates = [g for g in state.gate_results if g.stage == stage]
+                if gates and gates[-1].status == GateStatus.PASSED:
+                    self.log("Pipeline complete!")
+                    break
+
+            self.log(f"\n{'='*50}")
+            self.log(f"  v{state.current_version()}  STAGE: {stage.value}")
+            self.log(f"{'='*50}")
+
+            for rev in range(max_rev + 1):
+                if self._stop.is_set():
+                    self.log("Stopped by user.")
+                    return
+
+                result = self._do_step(instruction)
+                instruction = ""  # only first iteration uses custom instruction
+
+                if result.is_auth_error:
+                    self.log("Auth error — pipeline paused.")
+                    return
+
+                if not result.success and not result.output_files:
+                    self.log("No output, retrying...")
+                    continue
+
+                gr = self._do_review()
+                if gr and gr.status == GateStatus.PASSED:
+                    break
+
+                if rev < max_rev:
+                    state = self.sm.load_project(pid)
+                    state.increment_iteration()
+                    self.sm.save_project(state)
+                    self.log(f"  Revision {rev+1}/{max_rev} → v{state.current_version()}")
+
+            # Post-revision: check gate
+            state = self.sm.load_project(pid)
+            gates = [g for g in state.gate_results if g.stage == state.current_stage]
+            latest = gates[-1] if gates else None
+
+            if not latest or latest.status != GateStatus.PASSED:
+                self.log(f"Gate not passed for {stage.value}. Paused.")
+                break
+
+            # Human gate?
+            if stage in human_gates:
+                self.waiting_approval = True
+                self.stage_label = f"{stage.value} (awaiting approval)"
+                state = self.sm.load_project(pid)
+                if gates:
+                    gates[-1].status = GateStatus.HUMAN_REVIEW
+                state.record_event(VersionEventType.GATE_REVIEW,
+                                   f"Human gate: {stage.value}")
+                self.sm.save_project(state)
+                self.log(f"Human gate at {stage.value}. Click Approve to continue.")
+
+                self._approval.wait()
+                self._approval.clear()
+                self.waiting_approval = False
+
+                if self._stop.is_set():
+                    self.log("Stopped by user.")
+                    return
+
+                self.log("Approved! Advancing...")
+                state = self.sm.load_project(pid)
+                state.record_event(VersionEventType.HUMAN_APPROVE, "Human approved")
+                self.sm.save_project(state)
+
+            # Advance
+            idx = STAGE_ORDER.index(stage)
+            if idx < len(STAGE_ORDER) - 1:
+                nxt = STAGE_ORDER[idx + 1]
+                state = self.sm.load_project(pid)
+                trigger = ALLOWED_TRANSITIONS.get((stage, nxt), "auto_advance")
+                state.record_transition(nxt, trigger, gate_result=latest)
+                self.sm.save_project(state)
+                self.log(f">>> v{state.current_version()} Advanced → {nxt.value}")
+            else:
+                self.log("Pipeline complete!")
+                break
+
+
+# ---------------------------------------------------------------------------
+# OpenCode model discovery
+# ---------------------------------------------------------------------------
 
 def _get_opencode_models() -> list[str]:
-    """Get available opencode models by running `opencode models`."""
     import subprocess, os
     opencode_bin = os.environ.get("OPENCODE_BIN", os.path.expanduser("~/.opencode/bin/opencode"))
     try:
-        result = subprocess.run(
-            [opencode_bin, "models"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+        r = subprocess.run([opencode_bin, "models"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return [l.strip() for l in r.stdout.strip().split("\n") if l.strip()]
     except Exception:
         pass
     return ["volcengine-plan/doubao-seed-2.0-pro", "volcengine-plan/deepseek-v3.2"]
 
 
+# ---------------------------------------------------------------------------
+# HTML Template
+# ---------------------------------------------------------------------------
+
+_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Agent</title>
+<style>
+:root {
+  --bg:#0d1117;--sf:#161b22;--bd:#30363d;--tx:#e6edf3;--dim:#8b949e;--br:#f0f6fc;
+  --gr:#3fb950;--rd:#f85149;--yl:#d29922;--bl:#58a6ff;--pu:#bc8cff;--cy:#39d2c0;--or:#f0883e;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'SF Mono','Cascadia Code','Consolas',monospace;background:var(--bg);color:var(--tx);line-height:1.5;font-size:12px}
+.wrap{max-width:1440px;margin:0 auto;padding:10px 16px;display:flex;flex-direction:column;height:100vh}
+button{font-family:inherit;cursor:pointer}
+select,input{font-family:inherit;background:var(--sf);border:1px solid var(--bd);color:var(--tx);padding:4px 8px;border-radius:4px;font-size:11px}
+select:focus,input:focus{border-color:var(--bl);outline:none}
+
+/* Header */
+.hdr{display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.hdr h1{font-size:14px;color:var(--br);white-space:nowrap}
+.hdr .sep{flex:1}
+.badge{padding:2px 10px;border-radius:10px;font-size:11px;font-weight:600}
+.badge-v{background:var(--bl);color:var(--bg)}
+.badge-cost{color:var(--yl)}
+.btn{background:var(--sf);border:1px solid var(--bd);color:var(--dim);padding:3px 10px;border-radius:5px;font-size:11px}
+.btn:hover{border-color:var(--bl);color:var(--tx)}
+.btn.active{background:var(--bl);color:var(--bg);border-color:var(--bl)}
+.btn-gr{background:var(--gr);color:var(--bg);border:none;font-weight:600}
+.btn-gr:hover{opacity:.85}
+.btn-rd{background:var(--rd);color:#fff;border:none;font-weight:600}
+.btn-yl{background:var(--yl);color:var(--bg);border:none;font-weight:600}
+
+/* Control bar */
+.ctrl{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--bd);flex-wrap:wrap}
+.ctrl label{color:var(--dim);font-size:10px}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot-idle{background:var(--dim)}
+.dot-run{background:var(--gr);animation:pulse 1s infinite}
+.dot-wait{background:var(--yl);animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+/* Settings panel */
+.panel{display:none;background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:12px;margin:8px 0}
+.panel.vis{display:block}
+.panel h3{font-size:12px;color:var(--br);margin-bottom:8px}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.acard{background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:10px}
+.acard h4{font-size:11px;margin-bottom:6px;display:flex;align-items:center;gap:5px}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-researcher{background:var(--bl)}.dot-engineer{background:var(--gr)}.dot-critic{background:var(--pu)}.dot-orchestrator{background:var(--or)}
+.crow{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.crow label{font-size:10px;color:var(--dim);min-width:45px}
+.crow select,.crow input{flex:1}
+
+/* Stages */
+.stages{display:flex;gap:2px;padding:8px 0}
+.schip{flex:1;padding:5px 3px;border-radius:5px;text-align:center;font-size:9px;background:var(--sf);border:1px solid var(--bd);transition:.15s}
+.schip.done{background:#0d2818;border-color:var(--gr);color:var(--gr)}
+.schip.active{background:#1a1f35;border-color:var(--bl);color:var(--bl);box-shadow:0 0 6px rgba(88,166,255,.2)}
+.schip.failed{background:#2d1215;border-color:var(--rd);color:var(--rd)}
+.schip .al{display:block;font-size:7px;color:var(--dim);margin-top:1px}
+
+/* Main area */
+.main{display:grid;grid-template-columns:240px 1fr;gap:10px;flex:1;min-height:0;overflow:hidden;padding:8px 0}
+
+/* Sidebar */
+.side{background:var(--sf);border:1px solid var(--bd);border-radius:6px;display:flex;flex-direction:column;overflow:hidden}
+.side h3{padding:8px 12px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--bd);flex-shrink:0}
+.side-scroll{flex:1;overflow-y:auto}
+.vg{border-bottom:1px solid var(--bd)}
+.vh{padding:7px 12px;font-size:11px;font-weight:600;color:var(--br);cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+.vh:hover{background:rgba(88,166,255,.05)}
+.vh.sel{background:rgba(88,166,255,.1);border-left:3px solid var(--bl)}
+.stag{font-size:8px;padding:1px 5px;border-radius:3px;background:var(--bd);color:var(--dim);white-space:nowrap}
+.ves{padding:0 12px 4px}
+.ve{padding:2px 0;font-size:9px;color:var(--dim);display:flex;align-items:center;gap:4px}
+.ve .ico{width:12px;text-align:center;flex-shrink:0}
+
+/* Detail */
+.det{background:var(--sf);border:1px solid var(--bd);border-radius:6px;display:flex;flex-direction:column;overflow:hidden}
+.det-hdr{padding:10px 14px;border-bottom:1px solid var(--bd);flex-shrink:0;display:flex;justify-content:space-between;align-items:center}
+.det-hdr h2{font-size:13px;color:var(--br)}
+.det-scroll{flex:1;overflow-y:auto;padding:10px 14px}
+
+/* Event card */
+.ec{background:var(--bg);border:1px solid var(--bd);border-radius:5px;padding:10px;margin-bottom:8px}
+.ec-hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;flex-wrap:wrap;gap:3px}
+.ab{font-size:9px;padding:1px 7px;border-radius:8px;font-weight:600;white-space:nowrap}
+.ab-researcher{background:#1a2744;color:var(--bl)}.ab-critic{background:#2a1a2e;color:var(--pu)}
+.ab-engineer{background:#1a2e1e;color:var(--gr)}.ab-human{background:#2e2a1a;color:var(--yl)}
+.ev-s{font-size:11px;flex:1;min-width:0}
+.ev-m{font-size:9px;color:var(--dim);white-space:nowrap}
+.vd{font-weight:600}.vd-PASS{color:var(--gr)}.vd-FAIL{color:var(--rd)}.vd-REVISE{color:var(--yl)}
+.scores{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.sc{font-size:9px;padding:1px 6px;border-radius:3px;background:var(--bg);border:1px solid var(--bd)}
+.sc.p{border-color:var(--gr);color:var(--gr)}.sc.f{border-color:var(--rd);color:var(--rd)}
+.al-list{list-style:none;margin-top:4px}
+.al-list li{font-size:9px;padding:1px 0;color:var(--cy)}
+.al-list li::before{content:"\1F4C4 "}
+.dtxt{font-size:10px;white-space:pre-wrap;word-break:break-word;color:var(--tx);background:var(--bg);padding:8px;border-radius:3px;border:1px solid var(--bd);margin-top:6px;max-height:150px;overflow-y:auto;cursor:pointer;transition:max-height .3s}
+.dtxt.exp{max-height:none}
+.dtog{font-size:9px;color:var(--bl);cursor:pointer;margin-top:2px;user-select:none}
+
+/* Console */
+.console{background:#000;border:1px solid var(--bd);border-radius:6px;height:160px;display:flex;flex-direction:column;margin-top:8px;flex-shrink:0}
+.console-hdr{display:flex;justify-content:space-between;align-items:center;padding:4px 10px;border-bottom:1px solid var(--bd);flex-shrink:0}
+.console-hdr span{font-size:10px;color:var(--dim)}
+.console-body{flex:1;overflow-y:auto;padding:6px 10px;font-size:10px;color:var(--gr);line-height:1.4}
+.console-body .err{color:var(--rd)}
+
+/* Modal */
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-bg.vis{display:flex}
+.modal{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:20px;width:400px;max-width:90vw}
+.modal h3{font-size:14px;color:var(--br);margin-bottom:12px}
+.modal input{width:100%;margin-bottom:10px;padding:8px;font-size:12px}
+.modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+
+@media(max-width:800px){.main{grid-template-columns:1fr}.stages{flex-wrap:wrap}.sgrid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- Header -->
+  <div class="hdr">
+    <select id="projSel" onchange="switchProject(this.value)" style="max-width:220px"></select>
+    <button class="btn" onclick="showModal()">+ New</button>
+    <h1 id="projName"></h1>
+    <span class="sep"></span>
+    <span class="badge badge-cost" id="costLabel"></span>
+    <span class="badge badge-v" id="verLabel"></span>
+    <button class="btn" id="setBtn" onclick="togglePanel('setPanel',this)">Settings</button>
+    <button class="btn" onclick="location.reload()">Refresh</button>
+  </div>
+
+  <!-- Control bar -->
+  <div class="ctrl">
+    <button class="btn-gr" id="btnAuto" onclick="doAuto()">Auto</button>
+    <button class="btn" id="btnStep" onclick="doStep()">Step</button>
+    <button class="btn" id="btnReview" onclick="doReview()">Review</button>
+    <button class="btn-yl" id="btnApprove" onclick="doApprove()" style="display:none">Approve</button>
+    <button class="btn-rd" id="btnStop" onclick="doStop()" style="display:none">Stop</button>
+    <span style="color:var(--dim);font-size:10px">|</span>
+    <label>Until:</label>
+    <select id="untilStage"><option value="">all</option></select>
+    <label>Rev:</label>
+    <select id="maxRev"><option>1</option><option>2</option><option selected>3</option><option>5</option></select>
+    <label>Instruction:</label>
+    <input id="instrInput" style="flex:1;min-width:100px" placeholder="optional...">
+    <span class="sep"></span>
+    <span class="status-dot dot-idle" id="statusDot"></span>
+    <span id="statusLabel" style="font-size:10px;color:var(--dim)">Idle</span>
+  </div>
+
+  <!-- Settings panel -->
+  <div class="panel" id="setPanel">
+    <h3>CLI Backend Configuration</h3>
+    <div class="sgrid" id="setGrid"></div>
+    <div style="display:flex;align-items:center;margin-top:8px">
+      <button class="btn-gr" onclick="saveSettings()">Save</button>
+      <span id="saveMsg" style="font-size:10px;color:var(--gr);margin-left:10px;display:none"></span>
+    </div>
+  </div>
+
+  <!-- Stages -->
+  <div class="stages" id="stagesBar"></div>
+
+  <!-- Main: timeline + detail -->
+  <div class="main">
+    <div class="side">
+      <h3>Timeline (<span id="evCnt">0</span>)</h3>
+      <div class="side-scroll" id="timeline"></div>
+    </div>
+    <div class="det">
+      <div class="det-hdr">
+        <h2 id="detTitle">Select a version</h2>
+        <button class="btn" onclick="toggleAll()">Show All</button>
+      </div>
+      <div class="det-scroll" id="detScroll"></div>
+    </div>
+  </div>
+
+  <!-- Console -->
+  <div class="console">
+    <div class="console-hdr">
+      <span>Console</span>
+      <button class="btn" style="padding:1px 6px;font-size:9px" onclick="document.getElementById('conBody').innerHTML=''">Clear</button>
+    </div>
+    <div class="console-body" id="conBody"></div>
+  </div>
+</div>
+
+<!-- New Project Modal -->
+<div class="modal-bg" id="modalBg">
+  <div class="modal">
+    <h3>New Research Project</h3>
+    <input id="newName" placeholder="Project name">
+    <input id="newQ" placeholder="Research question">
+    <div class="btns">
+      <button class="btn" onclick="hideModal()">Cancel</button>
+      <button class="btn-gr" onclick="createProject()">Create</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let DATA=__DATA__,STAGES=__STAGES__,CFG=__CFG__,PROJECTS=__PROJECTS__,PID=__PID__,PIPE=__PIPE__;
+const OC_MODELS=__OC__;
+const BACKENDS=['claude','codex','opencode'];
+const MODELS={claude:['claude-sonnet-4-20250514','claude-opus-4-20250514','claude-haiku-4-5-20251001'],codex:['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],opencode:OC_MODELS};
+const EFFORTS={claude:['max','high','medium','low'],codex:['xhigh','high','medium','low'],opencode:['max','high','medium','low','minimal']};
+const ROLES=['researcher','engineer','critic','orchestrator'];
+const RC={researcher:'bl',engineer:'gr',critic:'pu',orchestrator:'or'};
+const STAGE_NAMES=__STAGE_NAMES__;
+const ICONS={agent_run:'\u25B6',gate_review:'\u25C6',gate_passed:'\u2713',gate_failed:'\u2717',stage_advance:'\u23E9',stage_rollback:'\u21A9',human_approve:'\uD83D\uDC64',human_reject:'\u270B',human_feedback:'\uD83D\uDCAC'};
+const ICOLORS={agent_run:'var(--bl)',gate_passed:'var(--gr)',gate_failed:'var(--rd)',stage_advance:'var(--cy)',stage_rollback:'var(--or)',human_approve:'var(--gr)',human_reject:'var(--rd)',human_feedback:'var(--yl)'};
+
+// --- Init ---
+function init(){
+  // Project selector
+  const ps=document.getElementById('projSel');
+  ps.innerHTML=PROJECTS.map(p=>`<option value="${p.id}" ${p.id===PID?'selected':''}>${p.name} (${p.stage})</option>`).join('');
+  document.getElementById('projName').textContent=DATA.project_name||'';
+  document.getElementById('costLabel').textContent='$'+DATA.total_cost;
+  document.getElementById('verLabel').textContent='v'+DATA.current_version;
+  // Until stage selector
+  const us=document.getElementById('untilStage');
+  STAGE_NAMES.forEach(s=>us.innerHTML+=`<option value="${s}">${s.replace(/_/g,' ')}</option>`);
+  document.getElementById('evCnt').textContent=DATA.timeline.length;
+  renderStages();renderTimeline();buildSettings();updatePipelineUI();
+}
+
+// --- Stages ---
+function renderStages(){
+  const el=document.getElementById('stagesBar');el.innerHTML='';
+  STAGES.forEach(s=>{
+    const d=document.createElement('div');d.className='schip '+s.status;
+    const bk=(CFG.agents||{})[s.agent]||{};
+    d.innerHTML=`v${s.index}.x ${s.name.replace(/_/g,' ')}<span class="al">${s.agent} (${bk.backend||'claude'})</span>`;
+    el.appendChild(d);
+  });
+}
+
+// --- Timeline ---
+let versions={},sortedV=[];
+function renderTimeline(){
+  versions={};
+  DATA.timeline.forEach(e=>{if(!versions[e.version])versions[e.version]={events:[],stage:e.stage};versions[e.version].events.push(e)});
+  sortedV=Object.keys(versions).sort((a,b)=>{const[ma,ia]=a.split('.').map(Number),[mb,ib]=b.split('.').map(Number);return ma!==mb?ma-mb:ia-ib});
+  const el=document.getElementById('timeline');el.innerHTML='';
+  sortedV.forEach(v=>{
+    const g=versions[v],hp=g.events.some(e=>e.event_type==='gate_passed'),hf=g.events.some(e=>e.event_type==='gate_failed');
+    const d=document.createElement('div');d.className='vg';
+    d.innerHTML=`<div class="vh" data-v="${v}" onclick="selVer('${v}',this)"><span>v${v} ${hp?'\u2713':hf?'\u2717':''}</span><span class="stag">${g.stage.replace(/_/g,' ')}</span></div><div class="ves">${g.events.map(e=>`<div class="ve"><span class="ico" style="color:${ICOLORS[e.event_type]||'var(--dim)'}">${ICONS[e.event_type]||'\u00B7'}</span><span>${e.summary.substring(0,40)}</span></div>`).join('')}</div>`;
+    el.appendChild(d);
+  });
+  if(sortedV.length){const l=sortedV[sortedV.length-1];const e=document.querySelector(`.vh[data-v="${l}"]`);if(e)selVer(l,e)}
+}
+
+let dtid=0;
+function selVer(v,el){
+  document.querySelectorAll('.vh').forEach(h=>h.classList.remove('sel'));
+  if(el)el.classList.add('sel');
+  const evs=versions[v]?.events||[];
+  document.getElementById('detTitle').textContent=`v${v} \u2014 ${(evs[0]?.stage||'').replace(/_/g,' ')}`;
+  const sc=document.getElementById('detScroll');sc.innerHTML='';
+  evs.forEach(ev=>{
+    const c=document.createElement('div');c.className='ec';
+    const ac=ev.agent?'ab-'+ev.agent:'',vc=ev.gate_verdict?'vd-'+ev.gate_verdict:'';
+    const cs=ev.cost_usd>0?` \u00B7 $${ev.cost_usd.toFixed(3)}`:'',ds=ev.duration_seconds>0?` \u00B7 ${ev.duration_seconds.toFixed(1)}s`:'';
+    let h=`<div class="ec-hdr"><div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">${ev.agent?`<span class="ab ${ac}">${ev.agent}</span>`:''}<span class="ev-s">${ev.summary}</span>${ev.gate_verdict?`<span class="vd ${vc}">${ev.gate_verdict}</span>`:''}</div><span class="ev-m">${ev.timestamp.substring(11,19)}${cs}${ds}</span></div>`;
+    if(ev.scores&&Object.keys(ev.scores).length)h+='<div class="scores">'+Object.entries(ev.scores).map(([k,v])=>`<span class="sc ${v>=0.7?'p':'f'}">${k}:${v}</span>`).join('')+'</div>';
+    const arts=[...(ev.artifacts_produced||[]),...(ev.artifacts_reviewed||[])];
+    if(arts.length)h+='<ul class="al-list">'+arts.map(a=>`<li>${a.split('/').pop()}</li>`).join('')+'</ul>';
+    if(ev.detail){const tid='d'+(++dtid);const esc=ev.detail.replace(/&/g,'&amp;').replace(/</g,'&lt;');const il=ev.detail.length>300;
+      h+=`<div class="dtxt${il?'':' exp'}" id="${tid}" onclick="this.classList.toggle('exp')">${esc}</div>`;
+      if(il)h+=`<div class="dtog" onclick="document.getElementById('${tid}').classList.toggle('exp')">more/less</div>`}
+    c.innerHTML=h;sc.appendChild(c);
+  });
+}
+
+let allExp=false;
+function toggleAll(){allExp=!allExp;document.querySelectorAll('.dtxt').forEach(e=>{allExp?e.classList.add('exp'):e.classList.remove('exp')})}
+
+// --- Settings ---
+function buildSettings(){
+  const g=document.getElementById('setGrid');g.innerHTML='';
+  ROLES.forEach(r=>{
+    const c=(CFG.agents||{})[r]||{};
+    const d=document.createElement('div');d.className='acard';
+    d.innerHTML=`<h4><span class="dot dot-${r}"></span>${r}</h4>
+      <div class="crow"><label>CLI</label><select id="s-${r}-b" onchange="onBk('${r}')">${BACKENDS.map(b=>`<option ${c.backend===b?'selected':''}>${b}</option>`).join('')}</select></div>
+      <div class="crow"><label>Model</label><select id="s-${r}-m"></select></div>
+      <div class="crow"><label>Effort</label><select id="s-${r}-e"></select></div>`;
+    g.appendChild(d);onBk(r,c.model,c.effort);
+  });
+}
+function onBk(r,cm,ce){
+  const b=document.getElementById(`s-${r}-b`).value;
+  const ms=document.getElementById(`s-${r}-m`),es=document.getElementById(`s-${r}-e`);
+  const ml=MODELS[b]||[];ms.innerHTML=ml.map(m=>`<option>${m}</option>`).join('');if(cm&&ml.includes(cm))ms.value=cm;
+  const el=EFFORTS[b]||['high'];es.innerHTML=el.map(e=>`<option>${e}</option>`).join('');if(ce&&el.includes(ce))es.value=ce;
+}
+function togglePanel(id,btn){const p=document.getElementById(id);const v=p.classList.toggle('vis');if(btn)btn.classList.toggle('active',v)}
+function saveSettings(){
+  const s={};ROLES.forEach(r=>s[r]={backend:document.getElementById(`s-${r}-b`).value,model:document.getElementById(`s-${r}-m`).value,effort:document.getElementById(`s-${r}-e`).value});
+  fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)}).then(r=>r.json()).then(d=>{
+    const m=document.getElementById('saveMsg');m.style.display='inline';m.textContent=d.ok?'Saved!':'Error';setTimeout(()=>m.style.display='none',2000);
+    if(d.ok){CFG.agents=CFG.agents||{};ROLES.forEach(r=>{CFG.agents[r]={...CFG.agents[r],...s[r]}});renderStages()}
+  });
+}
+
+// --- Pipeline control ---
+function doAuto(){post('/api/pipeline/auto',{until:document.getElementById('untilStage').value,max_rev:parseInt(document.getElementById('maxRev').value),instruction:document.getElementById('instrInput').value})}
+function doStep(){post('/api/pipeline/step',{instruction:document.getElementById('instrInput').value})}
+function doReview(){post('/api/pipeline/review',{})}
+function doApprove(){post('/api/pipeline/approve',{})}
+function doStop(){post('/api/pipeline/stop',{})}
+function post(url,data){fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(d=>{if(d.error)appendCon(d.error,true)})}
+
+// --- Pipeline status polling ---
+let lastLogLen=0;
+function pollStatus(){
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    PIPE=d;updatePipelineUI();
+    // Append new log lines
+    if(d.log&&d.log.length>lastLogLen){
+      const newLines=d.log.slice(lastLogLen);
+      newLines.forEach(l=>appendCon(`[${l.t}] ${l.m}`,l.m.includes('ERROR')));
+      lastLogLen=d.log.length;
+    }
+    // Refresh state data if pipeline was running
+    if(d.running||lastRunning){
+      fetch('/api/state').then(r=>r.json()).then(sd=>{
+        DATA=sd;
+        document.getElementById('verLabel').textContent='v'+sd.current_version;
+        document.getElementById('costLabel').textContent='$'+sd.total_cost;
+        document.getElementById('evCnt').textContent=sd.timeline.length;
+        renderTimeline();
+      });
+    }
+    lastRunning=d.running;
+  }).catch(()=>{});
+}
+let lastRunning=false;
+
+function updatePipelineUI(){
+  const r=PIPE.running,w=PIPE.waiting_approval;
+  const dot=document.getElementById('statusDot');
+  dot.className='status-dot '+(r?(w?'dot-wait':'dot-run'):'dot-idle');
+  document.getElementById('statusLabel').textContent=r?(w?'Awaiting approval':PIPE.mode+': '+PIPE.stage):'Idle';
+  document.getElementById('btnAuto').disabled=r;document.getElementById('btnStep').disabled=r;document.getElementById('btnReview').disabled=r;
+  document.getElementById('btnApprove').style.display=w?'inline-block':'none';
+  document.getElementById('btnStop').style.display=r?'inline-block':'none';
+}
+
+function appendCon(msg,isErr){
+  const el=document.getElementById('conBody');
+  const d=document.createElement('div');if(isErr)d.className='err';
+  d.textContent=msg;el.appendChild(d);el.scrollTop=el.scrollHeight;
+}
+
+// --- Project management ---
+function switchProject(pid){post('/api/project/switch',{id:pid});setTimeout(()=>location.reload(),300)}
+function showModal(){document.getElementById('modalBg').classList.add('vis');document.getElementById('newName').focus()}
+function hideModal(){document.getElementById('modalBg').classList.remove('vis')}
+function createProject(){
+  const n=document.getElementById('newName').value.trim(),q=document.getElementById('newQ').value.trim();
+  if(!n||!q)return;
+  fetch('/api/project/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,question:q})}).then(r=>r.json()).then(d=>{if(d.ok)location.reload()});
+}
+
+// Start polling
+init();
+setInterval(pollStatus,PIPE.running?2000:5000);
+// Adjust poll rate based on running state
+setInterval(()=>{},60000);
+</script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def build_gui_data(state: ProjectState) -> dict:
-    current_idx = STAGE_ORDER.index(state.current_stage)
+    ci = STAGE_ORDER.index(state.current_stage)
     stages = []
     for i, s in enumerate(STAGE_ORDER):
         gates = [g for g in state.gate_results if g.stage == s]
-        if i < current_idx:
-            status = "done"
-        elif i == current_idx:
-            status = "failed" if gates and gates[-1].status.value == "failed" else "active"
+        if i < ci:
+            st = "done"
+        elif i == ci:
+            st = "failed" if gates and gates[-1].status.value == "failed" else "active"
         else:
-            status = ""
-        stages.append({"index": i, "name": s.value, "agent": STAGE_PRIMARY_AGENT[s].value, "status": status})
+            st = ""
+        stages.append({"index": i, "name": s.value, "agent": STAGE_PRIMARY_AGENT[s].value, "status": st})
 
     timeline = []
     for ev in state.timeline:
@@ -463,101 +844,166 @@ def build_gui_data(state: ProjectState) -> dict:
     }
 
 
-def render_html(state: ProjectState, config: dict) -> str:
+def render_html(state: ProjectState, config: dict, projects: list, pipe_status: dict) -> str:
     data = build_gui_data(state)
-    opencode_models = _get_opencode_models()
-    html = _HTML_TEMPLATE
-    html = html.replace("{{PROJECT_NAME}}", data["project_name"])
-    html = html.replace("{{CURRENT_VERSION}}", data["current_version"])
-    html = html.replace("{{TOTAL_COST}}", data["total_cost"])
-    html = html.replace("{{DATA_JSON}}", json.dumps({"timeline": data["timeline"]}))
-    html = html.replace("{{STAGES_JSON}}", json.dumps(data["stages"]))
-    html = html.replace("{{CONFIG_JSON}}", json.dumps(config))
-    html = html.replace("{{OPENCODE_MODELS_JSON}}", json.dumps(opencode_models))
+    oc_models = _get_opencode_models()
+    proj_list = [{"id": p.project_id, "name": p.name, "stage": p.current_stage.value} for p in projects]
+
+    html = _HTML
+    replacements = {
+        "__DATA__": json.dumps(data),
+        "__STAGES__": json.dumps(data["stages"]),
+        "__CFG__": json.dumps(config),
+        "__PROJECTS__": json.dumps(proj_list),
+        "__PID__": json.dumps(state.project_id),
+        "__PIPE__": json.dumps(pipe_status),
+        "__OC__": json.dumps(oc_models),
+        "__STAGE_NAMES__": json.dumps([s.value for s in STAGE_ORDER]),
+    }
+    for k, v in replacements.items():
+        html = html.replace(k, v)
     return html
 
+
+# ---------------------------------------------------------------------------
+# HTTP Server
+# ---------------------------------------------------------------------------
 
 def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
-    config_path = None
-    # Find config file
-    for d in [sm.base_dir, Path.cwd()]:
-        p = d / "config" / "settings.yaml"
-        if p.exists():
-            config_path = p
-            break
+    base_dir = sm.base_dir
+    config_path = base_dir / "config" / "settings.yaml"
+    runner = PipelineRunner(sm, base_dir, config)
 
-    # Use mutable container so nested functions can update config
-    cfg_box = [config]
+    class H(BaseHTTPRequestHandler):
+        def _json_ok(self, data):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
 
-    class Handler(BaseHTTPRequestHandler):
+        def _read_body(self) -> dict:
+            length = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(length)) if length else {}
+
+        def _reload_cfg(self):
+            nonlocal config
+            if config_path.exists():
+                config = yaml.safe_load(config_path.read_text()) or {}
+                runner.reload_config(config)
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
-                state = sm.load_project(project_id)
-                if config_path and config_path.exists():
-                    cfg_box[0] = yaml.safe_load(config_path.read_text()) or {}
-                html = render_html(state, cfg_box[0])
+                self._reload_cfg()
+                pid = runner.project_id or project_id
+                try:
+                    state = sm.load_project(pid)
+                except FileNotFoundError:
+                    state = ProjectState(project_id="none", name="No Project", research_question="")
+                projects = sm.list_projects()
+                html = render_html(state, config, projects, runner.get_status())
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
                 self.wfile.write(html.encode())
+
             elif self.path == "/api/state":
-                state = sm.load_project(project_id)
-                data = build_gui_data(state)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps(data).encode())
+                pid = runner.project_id or project_id
+                try:
+                    state = sm.load_project(pid)
+                    self._json_ok(build_gui_data(state))
+                except FileNotFoundError:
+                    self._json_ok({"timeline": [], "stages": [], "current_version": "0.0", "total_cost": "0"})
+
+            elif self.path == "/api/status":
+                self._json_ok(runner.get_status())
+
+            elif self.path == "/api/projects":
+                ps = sm.list_projects()
+                self._json_ok([{"id": p.project_id, "name": p.name, "stage": p.current_stage.value} for p in ps])
+
             elif self.path == "/api/config":
-                if config_path and config_path.exists():
-                    cfg_box[0] = yaml.safe_load(config_path.read_text()) or {}
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(cfg_box[0]).encode())
+                self._reload_cfg()
+                self._json_ok(config)
+
             else:
                 self.send_error(404)
 
         def do_POST(self):
-            if self.path == "/api/config":
-                length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(length)
-                try:
-                    new_settings = json.loads(body)
-                    c = cfg_box[0]
-                    if "agents" not in c:
-                        c["agents"] = {}
-                    for role, vals in new_settings.items():
-                        if role not in c["agents"]:
-                            c["agents"][role] = {}
-                        c["agents"][role]["backend"] = vals.get("backend", "claude")
-                        c["agents"][role]["model"] = vals.get("model", "")
-                        c["agents"][role]["effort"] = vals.get("effort", "high")
-                    cfg_box[0] = c
+            body = self._read_body()
 
-                    if config_path:
+            if self.path == "/api/config":
+                try:
+                    if "agents" not in config:
+                        config["agents"] = {}
+                    for role, vals in body.items():
+                        if role not in config["agents"]:
+                            config["agents"][role] = {}
+                        for k in ("backend", "model", "effort"):
+                            if k in vals:
+                                config["agents"][role][k] = vals[k]
+                    if config_path.exists() or True:
+                        config_path.parent.mkdir(parents=True, exist_ok=True)
                         config_path.write_text(
-                            yaml.dump(cfg_box[0], default_flow_style=False, allow_unicode=True, width=120),
-                            encoding="utf-8",
-                        )
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": True}).encode())
+                            yaml.dump(config, default_flow_style=False, allow_unicode=True, width=120),
+                            encoding="utf-8")
+                    runner.reload_config(config)
+                    self._json_ok({"ok": True})
                 except Exception as e:
-                    self.send_response(400)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode())
+                    self._json_ok({"ok": False, "error": str(e)})
+
+            elif self.path == "/api/project/create":
+                try:
+                    pid = runner.create_project(body["name"], body["question"])
+                    self._json_ok({"ok": True, "id": pid})
+                except Exception as e:
+                    self._json_ok({"ok": False, "error": str(e)})
+
+            elif self.path == "/api/project/switch":
+                try:
+                    runner.project_id = body["id"]
+                    self._json_ok({"ok": True})
+                except Exception as e:
+                    self._json_ok({"ok": False, "error": str(e)})
+
+            elif self.path == "/api/pipeline/auto":
+                if runner.running:
+                    self._json_ok({"ok": False, "error": "Pipeline already running"})
+                else:
+                    runner.start_auto(body.get("until", ""), body.get("max_rev", 3), body.get("instruction", ""))
+                    self._json_ok({"ok": True})
+
+            elif self.path == "/api/pipeline/step":
+                if runner.running:
+                    self._json_ok({"ok": False, "error": "Pipeline already running"})
+                else:
+                    runner.start_step(body.get("instruction", ""))
+                    self._json_ok({"ok": True})
+
+            elif self.path == "/api/pipeline/review":
+                if runner.running:
+                    self._json_ok({"ok": False, "error": "Pipeline already running"})
+                else:
+                    runner.start_review()
+                    self._json_ok({"ok": True})
+
+            elif self.path == "/api/pipeline/approve":
+                runner.approve()
+                self._json_ok({"ok": True})
+
+            elif self.path == "/api/pipeline/stop":
+                runner.stop()
+                self._json_ok({"ok": True})
+
             else:
                 self.send_error(404)
 
         def do_OPTIONS(self):
             self.send_response(200)
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.end_headers()
 
@@ -565,7 +1011,7 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
             pass
 
     host = config.get("gui", {}).get("host", "127.0.0.1")
-    server = HTTPServer((host, port), Handler)
+    server = HTTPServer((host, port), H)
     print(f"Research Agent GUI: http://{host}:{port}")
     print("Press Ctrl+C to stop.\n")
     try:
