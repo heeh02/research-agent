@@ -215,7 +215,7 @@ class PipelineRunner:
         self.log(f"│  {stage.value} | {backend.value} | {d.models.get(role, '?')}")
         self.log(f"└─ Running...")
 
-        result = d.dispatch(task)
+        result = d.dispatch(task, progress_fn=self.log)
 
         if result.is_auth_error:
             self.log(f"AUTH ERROR — pipeline paused. Fix credentials and retry.")
@@ -285,7 +285,7 @@ class PipelineRunner:
         self.log(f"┌─ v{state.current_version()} Critic ({cb.value}/{d.models.get(AgentRole.CRITIC, '?')})")
         self.log(f"└─ Reviewing {stage.value}...")
 
-        result = d.dispatch(task)
+        result = d.dispatch(task, progress_fn=self.log)
 
         if result.is_auth_error or (not result.success and not result.output_text.strip()):
             self.log(f"Critic failed: {result.error or 'no output'}")

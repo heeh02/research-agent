@@ -185,8 +185,12 @@ class MultiAgentDispatcher:
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ORCHESTRATOR]),
         }
 
-    def dispatch(self, task: TaskCard) -> AgentResult:
-        """Dispatch task to the appropriate CLI backend with retry."""
+    def dispatch(self, task: TaskCard, progress_fn=None) -> AgentResult:
+        """Dispatch task to the appropriate CLI backend with retry.
+
+        Args:
+            progress_fn: Optional callback(str) for progress messages (heartbeat, file detected, etc.)
+        """
         role = task.role
         backend = self.backends.get(role, CLIBackend.CLAUDE)
 
@@ -207,6 +211,7 @@ class MultiAgentDispatcher:
                     output, exit_code = self._run_opencode(
                         prompt, model, effort,
                         expected_files=task.required_outputs,
+                        progress_fn=progress_fn,
                     )
                 else:
                     output, exit_code = self._run_claude(prompt, toolset, model, effort)
@@ -351,33 +356,29 @@ class MultiAgentDispatcher:
     def _run_opencode(self, prompt: str, model: str,
                       effort: str = "high",
                       expected_files: list[str] | None = None,
+                      progress_fn=None,
                       ) -> tuple[str, int]:
         """Run opencode run with a prompt. Returns (output, exit_code).
 
-        Key design: opencode starts a local server and may NOT exit after
-        completing a task. We use Popen + file-based completion detection:
-        1. Start process in its own session (so we can kill the whole tree)
-        2. Pipe the prompt via stdin (avoids CLI arg length limits)
-        3. Poll for expected output files on disk
-        4. When files appear (or timeout), kill the process group
-        5. Capture whatever stdout was produced
+        Key design: opencode starts a local server and may NOT exit after task
+        completion. We use Popen + file-based completion detection + heartbeat.
         """
         cmd = [
             OPENCODE_BIN, "run",
             "--dir", str(self.project_dir),
         ]
-
         if model:
             cmd.extend(["-m", model])
-
         if effort and effort != "none":
             cmd.extend(["--variant", effort])
-
-        # Pass prompt as the message argument (not via stdin, as opencode
-        # expects the message as positional args)
         cmd.append(prompt)
 
         timeout = 900 if effort == "max" else 600
+        _log = progress_fn or (lambda msg: None)
+
+        # Monitor opencode's tool-output directory for activity
+        tool_dir = Path.home() / ".local" / "share" / "opencode" / "tool-output"
+        tool_baseline = set(tool_dir.glob("*")) if tool_dir.exists() else set()
 
         # Start in new session so we can kill the entire process tree
         proc = subprocess.Popen(
@@ -387,52 +388,76 @@ class MultiAgentDispatcher:
             text=True,
             start_new_session=True,
         )
+        _log(f"  Process started (PID {proc.pid}, timeout {timeout}s)")
 
-        # Background thread to drain stdout (prevents pipe buffer deadlock)
+        # Background thread to drain stdout
         output_lines: list[str] = []
+        import threading
         def _drain():
             try:
                 for line in proc.stdout:
                     output_lines.append(line)
             except Exception:
                 pass
-
-        import threading
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
 
-        # Poll for completion: either process exits or expected files appear
-        start = time.time()
+        # Poll loop: check for file completion + report heartbeat
+        start_t = time.time()
         files_found = False
-        poll_interval = 5  # seconds between checks
+        last_heartbeat = 0
 
-        while time.time() - start < timeout:
-            # Check if process exited naturally
+        while time.time() - start_t < timeout:
+            elapsed = int(time.time() - start_t)
+
+            # Process exited?
             if proc.poll() is not None:
+                _log(f"  Process exited (code {proc.returncode}, {elapsed}s)")
                 break
 
-            # Check if expected output files exist on disk
+            # Expected files appeared?
             if expected_files:
-                all_exist = all(
-                    (self.project_dir / f).exists() for f in expected_files
-                )
-                if all_exist:
-                    # Files written! Give opencode a few seconds to finish cleanup
+                found = [(self.project_dir / f).exists() for f in expected_files]
+                if all(found):
                     files_found = True
-                    time.sleep(3)
+                    _log(f"  Output files detected! ({elapsed}s)")
+                    time.sleep(3)  # Let opencode finish cleanup
                     break
 
-            time.sleep(poll_interval)
+            # Heartbeat every 15 seconds with activity detection
+            if elapsed - last_heartbeat >= 15:
+                last_heartbeat = elapsed
+                # Detect opencode tool activity
+                activity = ""
+                if tool_dir.exists():
+                    current_tools = set(tool_dir.glob("*"))
+                    new_tools = current_tools - tool_baseline
+                    if new_tools:
+                        latest = max(new_tools, key=lambda p: p.stat().st_mtime)
+                        size_kb = latest.stat().st_size // 1024
+                        activity = f" | tool activity: {latest.name} ({size_kb}KB)"
+                        tool_baseline = current_tools  # Update baseline
 
-        # Collect output and kill process tree
+                _log(f"  Working... ({elapsed}s){activity}")
+
+            time.sleep(5)
+
+        # Kill process tree
         exit_code = proc.poll()
         if exit_code is None:
-            # Process still running — kill entire process group
+            elapsed = int(time.time() - start_t)
+            if files_found:
+                _log(f"  Stopping opencode (files complete, {elapsed}s)")
+            else:
+                _log(f"  Timeout ({elapsed}s), killing process")
             try:
                 os.killpg(os.getpgid(proc.pid), 9)
             except (ProcessLookupError, PermissionError):
-                proc.kill()
-            exit_code = 0 if files_found else 124  # 124 = timeout
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            exit_code = 0 if files_found else 124
 
         drain_thread.join(timeout=5)
         output = "".join(output_lines)
