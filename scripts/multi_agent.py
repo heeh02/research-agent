@@ -253,8 +253,19 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     stage = state.current_stage
     ver = state.current_version()
 
-    task = build_task_card(state, stage, AgentRole.CRITIC, project_id,
-                           f"Review {stage.value} artifacts for scientific rigor.")
+    from research_agent.agents.critic import STAGE_REVIEW_CRITERIA
+    criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+
+    # Build proper review instruction so non-codex critics know the expected format
+    review_instr = (
+        f"You are an adversarial scientific reviewer. Review the {stage.value} artifacts.\n\n"
+        f"## Review Criteria\n{criteria}\n\n"
+        f"## Required Output Format\n"
+        f"Output a YAML block with: verdict (PASS|REVISE|FAIL), scores, "
+        f"blocking_issues, suggestions, strongest_objection, what_would_make_it_pass.\n"
+        f"VERDICT must be exactly one of: PASS, REVISE, or FAIL.\n"
+    )
+    task = build_task_card(state, stage, AgentRole.CRITIC, project_id, review_instr)
 
     critic_backend = dispatcher.backends.get(AgentRole.CRITIC, "codex")
     critic_model = dispatcher.models.get(AgentRole.CRITIC, "gpt-5.4")

@@ -249,7 +249,37 @@ class PipelineRunner:
         d = self._get_dispatcher()
         self.stage_label = stage.value
 
-        task = self._build_task(state, stage, AgentRole.CRITIC, f"Review {stage.value} artifacts.")
+        # Build a proper review instruction with criteria and verdict format
+        from .agents.critic import STAGE_REVIEW_CRITERIA
+        criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+
+        # Read latest artifacts to include in review prompt
+        art_summaries = []
+        for a in state.stage_artifacts(stage):
+            try:
+                content = self.sm.read_artifact_file(pid, a)
+                art_summaries.append(f"### {a.artifact_type.value} (v{a.version})\n```yaml\n{content[:3000]}\n```")
+            except Exception:
+                pass
+
+        review_instruction = (
+            f"You are an adversarial scientific reviewer. Review the {stage.value} artifacts.\n\n"
+            f"## Review Criteria\n{criteria}\n\n"
+            f"## Artifacts to Review\n" + "\n\n".join(art_summaries) + "\n\n"
+            f"## Required Output Format\n"
+            f"You MUST output a YAML block with these exact fields:\n"
+            f"```yaml\n"
+            f"verdict: PASS | REVISE | FAIL\n"
+            f"scores: {{rigor: 0.0-1.0, completeness: 0.0-1.0, clarity: 0.0-1.0, novelty: 0.0-1.0}}\n"
+            f"blocking_issues: [list of issues that MUST be fixed]\n"
+            f"suggestions: [list of improvements]\n"
+            f"strongest_objection: <the single biggest problem>\n"
+            f"what_would_make_it_pass: <concrete actionable guidance>\n"
+            f"```\n"
+            f"VERDICT must be exactly one of: PASS, REVISE, or FAIL.\n"
+        )
+
+        task = self._build_task(state, stage, AgentRole.CRITIC, review_instruction)
 
         cb = d.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
         self.log(f"┌─ v{state.current_version()} Critic ({cb.value}/{d.models.get(AgentRole.CRITIC, '?')})")

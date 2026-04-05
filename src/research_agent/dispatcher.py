@@ -204,7 +204,10 @@ class MultiAgentDispatcher:
             start = time.time()
             try:
                 if backend == CLIBackend.OPENCODE:
-                    output, exit_code = self._run_opencode(prompt, model, effort)
+                    output, exit_code = self._run_opencode(
+                        prompt, model, effort,
+                        expected_files=task.required_outputs,
+                    )
                 else:
                     output, exit_code = self._run_claude(prompt, toolset, model, effort)
             except subprocess.TimeoutExpired:
@@ -346,11 +349,21 @@ class MultiAgentDispatcher:
     # -----------------------------------------------------------------------
 
     def _run_opencode(self, prompt: str, model: str,
-                      effort: str = "high") -> tuple[str, int]:
-        """Run opencode run with a prompt. Returns (output, exit_code)."""
+                      effort: str = "high",
+                      expected_files: list[str] | None = None,
+                      ) -> tuple[str, int]:
+        """Run opencode run with a prompt. Returns (output, exit_code).
+
+        Key design: opencode starts a local server and may NOT exit after
+        completing a task. We use Popen + file-based completion detection:
+        1. Start process in its own session (so we can kill the whole tree)
+        2. Pipe the prompt via stdin (avoids CLI arg length limits)
+        3. Poll for expected output files on disk
+        4. When files appear (or timeout), kill the process group
+        5. Capture whatever stdout was produced
+        """
         cmd = [
             OPENCODE_BIN, "run",
-            "--format", "json",
             "--dir", str(self.project_dir),
         ]
 
@@ -360,37 +373,74 @@ class MultiAgentDispatcher:
         if effort and effort != "none":
             cmd.extend(["--variant", effort])
 
+        # Pass prompt as the message argument (not via stdin, as opencode
+        # expects the message as positional args)
         cmd.append(prompt)
 
         timeout = 900 if effort == "max" else 600
-        result = subprocess.run(
+
+        # Start in new session so we can kill the entire process tree
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True, text=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
         )
 
-        output = result.stdout
-        # Parse JSON output — extract assistant messages
-        if output.strip():
-            text_parts = []
-            for line in output.strip().split("\n"):
-                try:
-                    event = json.loads(line)
-                    # opencode json format: look for text/assistant content
-                    if isinstance(event, dict):
-                        content = event.get("content", "") or event.get("text", "")
-                        role = event.get("role", "") or event.get("type", "")
-                        if role in ("assistant", "message", "text") and content:
-                            text_parts.append(content)
-                except json.JSONDecodeError:
-                    # Not JSON — raw text output
-                    text_parts.append(line)
-            if text_parts:
-                output = "\n".join(text_parts)
+        # Background thread to drain stdout (prevents pipe buffer deadlock)
+        output_lines: list[str] = []
+        def _drain():
+            try:
+                for line in proc.stdout:
+                    output_lines.append(line)
+            except Exception:
+                pass
 
-        if result.returncode != 0 and not output.strip():
-            output = result.stderr
-        return output, result.returncode
+        import threading
+        drain_thread = threading.Thread(target=_drain, daemon=True)
+        drain_thread.start()
+
+        # Poll for completion: either process exits or expected files appear
+        start = time.time()
+        files_found = False
+        poll_interval = 5  # seconds between checks
+
+        while time.time() - start < timeout:
+            # Check if process exited naturally
+            if proc.poll() is not None:
+                break
+
+            # Check if expected output files exist on disk
+            if expected_files:
+                all_exist = all(
+                    (self.project_dir / f).exists() for f in expected_files
+                )
+                if all_exist:
+                    # Files written! Give opencode a few seconds to finish cleanup
+                    files_found = True
+                    time.sleep(3)
+                    break
+
+            time.sleep(poll_interval)
+
+        # Collect output and kill process tree
+        exit_code = proc.poll()
+        if exit_code is None:
+            # Process still running — kill entire process group
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            exit_code = 0 if files_found else 124  # 124 = timeout
+
+        drain_thread.join(timeout=5)
+        output = "".join(output_lines)
+
+        if not output.strip() and files_found:
+            output = f"Files produced: {expected_files}"
+
+        return output, exit_code
 
     # -----------------------------------------------------------------------
     # Internal — Codex CLI (with retry)
