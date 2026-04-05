@@ -72,11 +72,15 @@ class PipelineRunner:
             self._cfg_ver = self._cur_cfg_ver
         return self._dispatcher
 
-    def reload_config(self, config: dict):
+    def reload_config(self, config: dict, silent: bool = False):
         self.config = config
         self._cur_cfg_ver += 1
-        self._dispatcher = None
-        self.log(f"Config reloaded (v{self._cur_cfg_ver}). New settings apply to next step.")
+        # Don't null dispatcher while pipeline is running — it will pick up
+        # the new config version on the next _get_dispatcher() call automatically
+        if not self.running:
+            self._dispatcher = None
+        if not silent:
+            self.log(f"Config updated. New settings apply to next step.")
 
     def log(self, msg: str):
         self.log_lines.append({"t": datetime.now().strftime("%H:%M:%S"), "m": msg})
@@ -937,6 +941,7 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
     base_dir = sm.base_dir
     config_path = base_dir / "config" / "settings.yaml"
     runner = PipelineRunner(sm, base_dir, config)
+    last_cfg_mtime = config_path.stat().st_mtime if config_path.exists() else 0
 
     class H(BaseHTTPRequestHandler):
         def _json_ok(self, data):
@@ -951,10 +956,16 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
             return json.loads(self.rfile.read(length)) if length else {}
 
         def _reload_cfg(self):
-            nonlocal config
-            if config_path.exists():
-                config = yaml.safe_load(config_path.read_text()) or {}
-                runner.reload_config(config)
+            """Only reload config if the yaml file was modified since last check."""
+            nonlocal config, last_cfg_mtime
+            if not config_path.exists():
+                return
+            mtime = config_path.stat().st_mtime
+            if mtime <= last_cfg_mtime:
+                return  # File unchanged, skip reload
+            last_cfg_mtime = mtime
+            config = yaml.safe_load(config_path.read_text()) or {}
+            runner.reload_config(config, silent=True)  # Silent — no log spam
 
         def do_GET(self):
             if self.path in ("/", "/index.html"):
@@ -1011,7 +1022,9 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
                         config_path.write_text(
                             yaml.dump(config, default_flow_style=False, allow_unicode=True, width=120),
                             encoding="utf-8")
-                    runner.reload_config(config)
+                    nonlocal last_cfg_mtime
+                    last_cfg_mtime = config_path.stat().st_mtime
+                    runner.reload_config(config, silent=False)  # User clicked Save → log it
                     self._json_ok({"ok": True})
                 except Exception as e:
                     self._json_ok({"ok": False, "error": str(e)})
