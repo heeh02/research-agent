@@ -373,7 +373,8 @@ class MultiAgentDispatcher:
             cmd.extend(["--variant", effort])
         cmd.append(prompt)
 
-        timeout = 900 if effort == "max" else 600
+        # OpenCode agents are slower (subagents + web fetching) — need more time
+        timeout = 1800 if effort == "max" else 1200
         _log = progress_fn or (lambda msg: None)
 
         # Monitor opencode's tool-output directory for activity
