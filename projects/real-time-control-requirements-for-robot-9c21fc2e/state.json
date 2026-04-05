@@ -1,0 +1,17 @@
+{
+  "project_id": "real-time-control-requirements-for-robot-9c21fc2e",
+  "name": "Real-time Control Requirements for Robotic Manipulation",
+  "description": "",
+  "research_question": "What are the quantitative real-time control requirements for robotic manipulation systems, including latency thresholds, control frequencies, and performance impacts?",
+  "current_stage": "problem_definition",
+  "artifacts": [],
+  "gate_results": [],
+  "transitions": [],
+  "cost_records": [],
+  "messages": [],
+  "timeline": [],
+  "iteration_count": {},
+  "config_overrides": {},
+  "created_at": "2026-04-05T14:45:31.728803",
+  "updated_at": "2026-04-05T14:45:31.729929"
+}

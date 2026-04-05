@@ -1,0 +1,17 @@
+{
+  "project_id": "rt-2-and-palm-e-vision-language-action-m-cd83adbb",
+  "name": "RT-2 and PaLM-E Vision-Language-Action Models",
+  "description": "",
+  "research_question": "What are the detailed architecture specifications, training methodologies, performance results, and implementation approaches for RT-2 and PaLM-E models in robotics applications?",
+  "current_stage": "problem_definition",
+  "artifacts": [],
+  "gate_results": [],
+  "transitions": [],
+  "cost_records": [],
+  "messages": [],
+  "timeline": [],
+  "iteration_count": {},
+  "config_overrides": {},
+  "created_at": "2026-04-05T14:44:27.680985",
+  "updated_at": "2026-04-05T14:44:27.680990"
+}

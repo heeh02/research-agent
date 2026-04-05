@@ -1,0 +1,17 @@
+{
+  "project_id": "vla-training-efficiency-research-fddfc8cf",
+  "name": "VLA Training Efficiency Research",
+  "description": "",
+  "research_question": "What are the training efficiency challenges in Vision-Language-Action (VLA) models for robotics (2023-2025), including: 1) Data efficiency problems (large datasets required), 2) Multi-modal training computational costs, 3) Sim-to-real transfer efficiency, 4) Few-shot learning approaches, and 5) Training infrastructure requirements? Focus on papers with specific quantitative metrics: training costs, dataset sizes, compute requirements (GPU hours, FLOPs), and efficiency improvement methods.",
+  "current_stage": "problem_definition",
+  "artifacts": [],
+  "gate_results": [],
+  "transitions": [],
+  "cost_records": [],
+  "messages": [],
+  "timeline": [],
+  "iteration_count": {},
+  "config_overrides": {},
+  "created_at": "2026-04-05T14:43:58.752401",
+  "updated_at": "2026-04-05T14:43:58.752405"
+}

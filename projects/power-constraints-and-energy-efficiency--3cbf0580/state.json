@@ -1,0 +1,17 @@
+{
+  "project_id": "power-constraints-and-energy-efficiency--3cbf0580",
+  "name": "Power Constraints and Energy Efficiency Challenges for AI Models in Robotics Systems",
+  "description": "",
+  "research_question": "What are the power consumption characteristics, energy efficiency challenges, and thermal management requirements for deploying large AI models (particularly vision-language-action models) on robotic systems, including quantitative measurements of power consumption, battery life impact, and energy optimization techniques?",
+  "current_stage": "problem_definition",
+  "artifacts": [],
+  "gate_results": [],
+  "transitions": [],
+  "cost_records": [],
+  "messages": [],
+  "timeline": [],
+  "iteration_count": {},
+  "config_overrides": {},
+  "created_at": "2026-04-05T14:45:50.466502",
+  "updated_at": "2026-04-05T14:45:50.466535"
+}

@@ -39,11 +39,9 @@ agents:
     model: claude-sonnet-4-20250514
     effort: high
     max_turns: 40
-    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep,Agent"
-    # Agent tool enables subagents for:
-    #   - Parallel code exploration
-    #   - Running tests in isolated worktrees
-    #   - Debugging assistance
+    allowed_tools: "Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent"
+    # WebSearch/WebFetch = access GitHub source code, docs, library APIs
+    # Agent = subagents for parallel code exploration, testing, debugging
 
   orchestrator:
     provider: claude

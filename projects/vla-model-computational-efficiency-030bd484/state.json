@@ -1,0 +1,17 @@
+{
+  "project_id": "vla-model-computational-efficiency-030bd484",
+  "name": "VLA Model Computational Efficiency",
+  "description": "",
+  "research_question": "What are the specific memory constraints, GPU VRAM requirements, context length limitations, and scaling challenges for Vision-Language-Action (VLA) models in robotics? Include specific numbers (GB VRAM), memory bottlenecks during training vs inference, context length impacts on long-horizon tasks, and memory-efficient training techniques with citations.",
+  "current_stage": "problem_definition",
+  "artifacts": [],
+  "gate_results": [],
+  "transitions": [],
+  "cost_records": [],
+  "messages": [],
+  "timeline": [],
+  "iteration_count": {},
+  "config_overrides": {},
+  "created_at": "2026-04-05T14:44:02.563181",
+  "updated_at": "2026-04-05T14:44:02.563188"
+}

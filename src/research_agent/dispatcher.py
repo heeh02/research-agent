@@ -30,9 +30,9 @@ from .models import AgentRole, CostRecord, LLMProvider, ProjectState, Stage
 # ---------------------------------------------------------------------------
 
 class AgentToolset(str, Enum):
-    # Agent = subagent spawning (deep research, parallel searches, code exploration)
+    # Agent = subagent spawning; WebSearch/WebFetch = internet access
     RESEARCHER = "Read,Write,Glob,Grep,WebSearch,WebFetch,Agent"
-    ENGINEER = "Read,Write,Edit,Bash,Glob,Grep,Agent"
+    ENGINEER = "Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent"
     ORCHESTRATOR = "Read,Write,Bash,Glob,Grep"
 
 
@@ -377,11 +377,16 @@ class MultiAgentDispatcher:
         from .integrations.codex import codex_review
         from .agents.critic import STAGE_REVIEW_CRITERIA
 
+        # Build READABLE prose for Codex, not raw YAML dumps.
+        # Codex reviews better when it reads a narrative, not a schema.
         context_parts = []
         for f in task.context_files:
             p = self.project_dir / f
             if p.exists():
-                context_parts.append(f"## {p.name}\n{p.read_text()}")
+                raw = p.read_text(encoding="utf-8")
+                context_parts.append(
+                    self._yaml_to_readable(p.name, raw)
+                )
 
         criteria = STAGE_REVIEW_CRITERIA.get(task.stage.value, "Review for rigor.")
 
@@ -442,3 +447,50 @@ class MultiAgentDispatcher:
         log_file = log_dir / f"{task.task_id}.txt"
         log_file.write_text(output, encoding="utf-8")
         return log_file
+
+    @staticmethod
+    def _yaml_to_readable(filename: str, raw_yaml: str) -> str:
+        """Convert a YAML artifact to readable prose for Codex review.
+
+        Codex reviews much better when given a narrative description
+        rather than raw YAML schema. This turns structured data into
+        a readable research document.
+        """
+        try:
+            data = yaml.safe_load(raw_yaml)
+        except yaml.YAMLError:
+            return f"## {filename}\n{raw_yaml}"
+
+        if not isinstance(data, dict):
+            return f"## {filename}\n{raw_yaml}"
+
+        lines = [f"## {filename}\n"]
+
+        for key, value in data.items():
+            heading = key.replace("_", " ").title()
+
+            if isinstance(value, str):
+                lines.append(f"### {heading}\n{value}\n")
+
+            elif isinstance(value, list):
+                lines.append(f"### {heading}")
+                for i, item in enumerate(value, 1):
+                    if isinstance(item, dict):
+                        parts = []
+                        for k, v in item.items():
+                            parts.append(f"{k}: {v}")
+                        lines.append(f"  {i}. " + " | ".join(parts))
+                    else:
+                        lines.append(f"  {i}. {item}")
+                lines.append("")
+
+            elif isinstance(value, dict):
+                lines.append(f"### {heading}")
+                for k, v in value.items():
+                    lines.append(f"  - {k}: {v}")
+                lines.append("")
+
+            else:
+                lines.append(f"### {heading}\n{value}\n")
+
+        return "\n".join(lines)

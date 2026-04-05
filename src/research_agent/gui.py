@@ -65,9 +65,11 @@ body { font-family: 'SF Mono','Cascadia Code','Consolas',monospace; background: 
 
 /* Detail panel — FULLY SCROLLABLE */
 .detail { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
-.detail-header { padding: 14px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.detail-header { padding: 14px 18px; border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
 .detail-header h2 { font-size: 15px; color: var(--text-bright); }
 .detail-scroll { flex: 1; overflow-y: auto; padding: 14px 18px; }
+.show-all-btn { background: var(--border); border: 1px solid var(--text-dim); color: var(--text); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 11px; font-family: inherit; white-space: nowrap; }
+.show-all-btn:hover { background: var(--blue); color: var(--bg); border-color: var(--blue); }
 
 /* Event card */
 .event-card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; margin-bottom: 10px; }
@@ -130,7 +132,10 @@ body { font-family: 'SF Mono','Cascadia Code','Consolas',monospace; background: 
       <div class="sidebar-scroll" id="timeline"></div>
     </div>
     <div class="detail">
-      <div class="detail-header"><h2 id="detailTitle">Select a version</h2></div>
+      <div class="detail-header">
+        <h2 id="detailTitle">Select a version</h2>
+        <button class="show-all-btn" id="showAllBtn" onclick="toggleShowAll()">Show All</button>
+      </div>
       <div class="detail-scroll" id="detailScroll">
         <p style="color:var(--text-dim);font-size:12px;">Click a version on the left to see agent interactions.</p>
       </div>
@@ -245,6 +250,20 @@ function selectVersion(ver, el) {
     card.innerHTML = html;
     scroll.appendChild(card);
   });
+}
+
+// Show All toggle — expand/collapse every detail-text at once
+let allExpanded = false;
+function toggleShowAll() {
+  allExpanded = !allExpanded;
+  document.querySelectorAll('.detail-text').forEach(el => {
+    if (allExpanded) el.classList.add('expanded');
+    else el.classList.remove('expanded');
+  });
+  document.querySelectorAll('.detail-text-toggle').forEach(el => {
+    el.textContent = allExpanded ? 'Show less' : 'Show more';
+  });
+  document.getElementById('showAllBtn').textContent = allExpanded ? 'Collapse All' : 'Show All';
 }
 
 // Auto-select latest
