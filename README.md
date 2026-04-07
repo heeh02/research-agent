@@ -38,6 +38,7 @@ Each agent's **CLI backend and model are fully configurable** — swap between C
 - [Agent Roles](#agent-roles)
 - [Quality Gate System](#quality-gate-system)
 - [Artifact Communication](#artifact-communication)
+- [Storage Architecture](#storage-architecture)
 - [Web GUI](#web-gui)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
@@ -331,6 +332,280 @@ key_risks:
   - "Importance scores computed on one task family may not transfer"
 ```
 
+### Storage Architecture
+
+The system uses a **file-based, zero-database persistence model**. All state is stored as JSON and YAML on the local filesystem, with no external database dependency. This section details the five storage layers, their data models, write semantics, and how they interact.
+
+#### Layer 1: ProjectState — The Central State Store
+
+Every project has a single source of truth: `projects/<id>/state.json`. This file is a JSON-serialized [Pydantic](https://docs.pydantic.dev/) `ProjectState` model containing the complete project lifecycle.
+
+**Data Model** (`src/research_agent/models.py`):
+
+```
+ProjectState
+├── project_id: str                    # Slug + UUID suffix (e.g. "vla-model-0ddc306e")
+├── name: str                          # Human-readable project name
+├── description: str
+├── research_question: str             # The driving research question
+├── current_stage: Stage               # Enum: one of 7 stages
+├── artifacts: list[Artifact]          # Every artifact ever produced (append-only)
+├── gate_results: list[GateResult]     # Every gate evaluation ever run (append-only)
+├── transitions: list[StageTransition] # Stage change history (append-only)
+├── cost_records: list[CostRecord]     # Per-call API cost tracking (append-only)
+├── messages: list[AgentMessage]       # Inter-agent messages (append-only)
+├── timeline: list[VersionEvent]       # Semantic-versioned event log (append-only)
+├── iteration_count: dict[str, int]    # stage_name → current iteration number
+├── config_overrides: dict             # Per-project config overrides
+├── created_at: datetime
+└── updated_at: datetime
+```
+
+**Key sub-models stored inline in state.json:**
+
+| Model | Fields | Purpose |
+|-------|--------|---------|
+| `Artifact` | name, artifact_type, stage, version, path, created_by, created_at, metadata, provenance | Registry of every artifact file, with its disk path and creation provenance |
+| `GateResult` | gate_name, stage, status, checks[], reviewer, overall_feedback, iteration, timestamp | Full gate evaluation result, including per-criterion scores and feedback text |
+| `GateCheck` | name, description, check_type, passed, score, feedback | Individual check within a gate (schema / codex / automated / human) |
+| `StageTransition` | from_stage, to_stage, trigger, gate_result, timestamp, notes | Record of each forward advance or backward rollback |
+| `CostRecord` | agent, provider, model, input_tokens, output_tokens, cost_usd, task_description, stage, timestamp | Per-LLM-call cost tracking for budget enforcement |
+| `VersionEvent` | version, event_type, agent, stage, summary, detail, artifacts_produced, gate_verdict, scores, cost_usd, duration_seconds, timestamp | Semantic-versioned audit event for the timeline |
+
+**Append-only invariant**: The `artifacts`, `gate_results`, `transitions`, `cost_records`, and `timeline` lists are strictly append-only. No entry is ever modified or deleted. This makes `state.json` a complete, auditable log of everything that happened in the project — you can reconstruct the exact sequence of agent runs, gate evaluations, rollbacks, and costs by reading it.
+
+**Atomic write protocol** (`state.py:_save_state`):
+
+```python
+def _save_state(self, state: ProjectState) -> None:
+    state_file = project_dir / "state.json"
+    tmp_file   = project_dir / "state.json.tmp"
+    # 1. Serialize to temporary file
+    tmp_file.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+    # 2. Atomic rename (POSIX guarantees this is atomic on same filesystem)
+    tmp_file.replace(state_file)
+```
+
+If the process crashes during step 1, `state.json` is untouched. If it crashes during step 2, the rename is atomic — the file is either the old version or the new version, never a partial write. This eliminates corruption without WAL, journaling, or locking.
+
+**Semantic versioning** (`ProjectState.current_version`):
+
+```
+Version = {stage_index}.{iteration_count}
+Example: "2.3" = Stage 2 (hypothesis_formation), iteration 3
+```
+
+This is computed, not stored — derived from `current_stage` and `iteration_count`. Every `VersionEvent` in the timeline records this version, creating a human-readable audit trail.
+
+#### Layer 2: Artifact Files — The Inter-Agent Communication Channel
+
+Agents communicate **exclusively** through versioned YAML files on disk. Each artifact has a canonical path derived from its type and version number.
+
+**Storage layout:**
+
+```
+projects/<project-id>/
+└── artifacts/
+    ├── problem_definition/
+    │   └── problem_brief_v1.yaml          # Researcher output, iteration 1
+    ├── literature_review/
+    │   ├── literature_map_v1.yaml          # First attempt
+    │   ├── literature_map_v2.yaml          # After critic feedback
+    │   └── evidence_table_v1.yaml
+    ├── hypothesis_formation/
+    │   └── hypothesis_card_v1.yaml
+    ├── experiment_design/
+    │   └── experiment_spec_v1.yaml
+    ├── implementation/
+    │   ├── code_v1.yaml                    # Engineer's code (YAML-wrapped)
+    │   ├── test_result_v1.yaml             # Engineer's draft
+    │   └── test_result_v2.yaml             # Orchestrator's VERIFIED result
+    ├── experimentation/
+    │   ├── run_manifest_v1.yaml
+    │   ├── metrics_v1.yaml                 # Engineer's draft
+    │   └── metrics_v2.yaml                 # Orchestrator's VERIFIED metrics
+    └── analysis/
+        ├── result_report_v1.yaml
+        └── claim_checklist_v1.yaml
+```
+
+**Canonical path derivation** (`artifacts.py:create_artifact`):
+
+The path is **always** derived from `artifact_type + computed_version`, never from the filename the agent writes. This prevents a critical class of bugs where state.json records version N but the file on disk is version M:
+
+```python
+canonical = f"{artifact_type.value}_v{version}.yaml"
+rel_path  = f"artifacts/{stage.value}/{canonical}"
+```
+
+If an agent writes to a non-canonical filename, `register_artifact_file` renames the file to match.
+
+**Immutability**: Artifacts are never overwritten. A revision always creates `_v{N+1}`. The `state.latest_artifact(type)` method returns the highest-version artifact for a given type, but all previous versions remain on disk as historical records.
+
+**Schema enforcement** (`schemas/*.schema.yaml`):
+
+Each of the 14 artifact types has a YAML schema defining structural constraints:
+
+```yaml
+# schemas/hypothesis_card.schema.yaml
+required_fields:
+  - claim
+  - motivation
+  - key_assumptions
+  - testable_predictions
+  - kill_criteria
+
+field_types:
+  claim: string
+  key_assumptions: list
+  testable_predictions: list
+
+min_lengths:
+  key_assumptions: 2
+  testable_predictions: 2
+  kill_criteria: 2
+```
+
+The gate system validates every artifact against its schema **before** any AI review. Schema validation catches structural failures (missing fields, wrong types, insufficient list entries) at zero token cost.
+
+#### Layer 3: Materialized Code — From YAML to Executable
+
+The `code` artifact is special. It stores source files **inside a YAML wrapper**:
+
+```yaml
+# artifacts/implementation/code_v1.yaml
+files:
+  - path: experiments/train.py
+    content: |
+      import torch
+      from datasets import load_dataset
+      ...
+  - path: experiments/model.py
+    content: |
+      class VLAModel(nn.Module):
+      ...
+  - path: experiments/test_model.py
+    content: |
+      def test_forward_pass():
+      ...
+```
+
+The Orchestrator **materializes** this YAML to real files on disk (`execution.py:materialize_code`):
+
+```
+projects/<id>/experiments/train.py       ← extracted from code_v1.yaml
+projects/<id>/experiments/model.py       ← extracted from code_v1.yaml
+projects/<id>/experiments/test_model.py  ← extracted from code_v1.yaml
+```
+
+After materialization, the Orchestrator runs `pytest` and the smoke test from `run_manifest` independently. The results are written back as **verified** `test_result` and `metrics` artifacts (with `verified_by: orchestrator` metadata), overriding any draft artifacts the Engineer produced. This is the key anti-fabrication mechanism — the Critic reviews the Orchestrator's verified output, not the Engineer's self-report.
+
+#### Layer 4: Execution Logs — Raw Process Output
+
+```
+projects/<id>/
+└── logs/
+    ├── problem_definition-a1b2c3.txt    # Raw stdout/stderr from agent dispatch
+    ├── experiment_execution.txt          # Smoke test / experiment output
+    └── ...
+```
+
+Log files capture the complete raw output of every agent subprocess and experiment execution. These are reference-only — they are not parsed by the pipeline (verdict parsing uses the structured YAML output), but they are invaluable for debugging failures.
+
+#### Layer 5: Configuration — Pipeline Behavior
+
+Configuration is split across two YAML files, both human-editable:
+
+**`config/settings.yaml`** — Runtime configuration:
+```
+settings.yaml
+├── agents:                    # Per-agent: backend, model, effort, max_turns, allowed_tools
+│   ├── researcher: {...}
+│   ├── engineer: {...}
+│   ├── critic: {...}
+│   └── orchestrator: {...}
+├── pipeline:
+│   ├── automation_level       # manual | hybrid | full
+│   ├── human_gates: [...]     # Which stages need human approval
+│   ├── max_iterations: 5      # Max revision cycles per stage
+│   └── confirm_before_advance
+├── cost:
+│   ├── warning_threshold      # Alert at this USD amount
+│   ├── hard_limit             # Stop pipeline at this USD amount
+│   └── codex_estimated_cost_per_review
+├── gui: { host, port }
+├── github: { enabled }
+└── tracking: { backend, enabled }
+```
+
+**`config/stages.yaml`** — Stage definitions (structural, rarely changed):
+```
+stages.yaml
+├── stages:
+│   └── <stage_name>:
+│       ├── description         # Bilingual stage description
+│       ├── primary_agent       # Who produces artifacts
+│       ├── reviewer            # Who reviews them
+│       ├── required_artifacts  # What must be produced
+│       ├── gate_criteria:      # Weighted scoring rubric
+│       │   └── [{name, description, weight}]
+│       ├── pass_threshold      # Minimum weighted average (default: 0.7)
+│       └── human_gate          # true/false
+└── rollback_rules:
+    └── [{from, to, trigger, description}]
+```
+
+The Web GUI can modify `settings.yaml` at runtime via the `/api/config` REST endpoint. Changes take effect on the next pipeline step without restarting.
+
+#### Data Flow Summary
+
+```
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │                         config/settings.yaml                         │
+ │                         config/stages.yaml                           │
+ │                    (read at dispatch time, hot-reloadable)            │
+ └──────────────────────────────┬────────────────────────────────────────┘
+                                │
+                                ▼
+ ┌──────────────────── Python Orchestrator ──────────────────────────────┐
+ │                                                                       │
+ │  1. Load state.json                                                   │
+ │  2. Read config → determine agent, backend, model                     │
+ │  3. Assemble context from prior artifacts                             │
+ │  4. Build TaskCard (YAML)                                             │
+ │  5. Dispatch agent subprocess                                         │
+ │     ├── Agent writes artifact YAML to artifacts/<stage>/              │
+ │     └── Raw output saved to logs/                                     │
+ │  6. Register artifact in state.artifacts[]                            │
+ │  7. [Implementation] Materialize code → experiments/                  │
+ │  8. [Implementation] Run pytest → write verified test_result          │
+ │  9. Dispatch critic → review artifacts                                │
+ │ 10. Parse verdict, scores, failure_type                               │
+ │ 11. Append GateResult to state.gate_results[]                         │
+ │ 12. Append VersionEvent to state.timeline[]                           │
+ │ 13. Append StageTransition to state.transitions[]                     │
+ │ 14. Atomic save state.json                                            │
+ │ 15. Loop or advance                                                   │
+ │                                                                       │
+ └───────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┼───────────────┐
+                    ▼           ▼               ▼
+              state.json   artifacts/       experiments/
+             (central     (YAML files,     (materialized
+              state)       immutable,       source code)
+                           versioned)
+```
+
+#### Why File-Based, Not Database?
+
+1. **Git-friendly**: Every state change is a file diff. `git log` gives you project history. `git diff state.json` shows exactly what changed.
+2. **Zero infrastructure**: No PostgreSQL, no Redis, no Docker. `pip install` and you're running.
+3. **Agent-compatible**: LLM agents can Read/Write files natively. No ORM, no SQL, no API client needed.
+4. **Debuggable**: `cat state.json | jq '.timeline[-1]'` shows the latest event. `cat artifacts/implementation/code_v1.yaml` shows exactly what the Engineer wrote. No query language needed.
+5. **Portable**: Copy the `projects/<id>/` directory and you have the complete project — state, artifacts, code, logs — in one place.
+6. **Crash-safe**: Atomic tmp+rename writes prevent corruption without transactions.
+
 ### Web GUI
 
 Launch the browser-based control panel:
@@ -604,6 +879,7 @@ Key test invariants:
 - [智能体角色](#智能体角色)
 - [质量门控系统](#质量门控系统)
 - [制品通信机制](#制品通信机制)
+- [存储架构](#存储架构)
 - [Web 图形界面](#web-图形界面)
 - [安装](#安装)
 - [快速开始](#快速开始)
@@ -873,6 +1149,202 @@ agents:
 #### 版本管理
 
 制品遵循 `<type>_v<version>.yaml` 命名约定。版本在阶段内单调递增。所有制品都是不可变的历史记录——修订创建新版本，永不覆写。
+
+### 存储架构
+
+系统采用**基于文件、零数据库的持久化模型**。所有状态以 JSON 和 YAML 形式存储在本地文件系统中，不依赖任何外部数据库。本节详述五个存储层、数据模型、写入语义及其交互方式。
+
+#### 第一层：ProjectState — 中央状态存储
+
+每个项目有一个单一真相来源：`projects/<id>/state.json`。该文件是 JSON 序列化的 [Pydantic](https://docs.pydantic.dev/) `ProjectState` 模型，包含完整的项目生命周期数据。
+
+**数据模型**（`src/research_agent/models.py`）：
+
+```
+ProjectState
+├── project_id: str                    # Slug + UUID 后缀（如 "vla-model-0ddc306e"）
+├── name: str                          # 项目名称
+├── description: str
+├── research_question: str             # 驱动研究的核心问题
+├── current_stage: Stage               # 枚举：7 个阶段之一
+├── artifacts: list[Artifact]          # 所有产出过的制品（只追加）
+├── gate_results: list[GateResult]     # 所有门控评估结果（只追加）
+├── transitions: list[StageTransition] # 阶段变更历史（只追加）
+├── cost_records: list[CostRecord]     # 每次 API 调用的成本记录（只追加）
+├── messages: list[AgentMessage]       # 智能体间消息（只追加）
+├── timeline: list[VersionEvent]       # 语义版本化事件日志（只追加）
+├── iteration_count: dict[str, int]    # 阶段名 → 当前迭代次数
+├── config_overrides: dict             # 项目级配置覆盖
+├── created_at: datetime
+└── updated_at: datetime
+```
+
+**内嵌在 state.json 中的关键子模型：**
+
+| 模型 | 核心字段 | 用途 |
+|------|---------|------|
+| `Artifact` | name, artifact_type, stage, version, path, created_by, metadata, provenance | 每个制品文件的注册表，含磁盘路径和创建溯源 |
+| `GateResult` | gate_name, stage, status, checks[], reviewer, overall_feedback, iteration | 完整的门控评估结果，包含各标准评分和反馈文本 |
+| `GateCheck` | name, check_type, passed, score, feedback | 门控内的单项检查（schema / codex / automated / human） |
+| `StageTransition` | from_stage, to_stage, trigger, gate_result, timestamp | 每次前进推进或后退回滚的记录 |
+| `CostRecord` | agent, provider, model, input_tokens, output_tokens, cost_usd, stage | 每次 LLM 调用的成本追踪，用于预算执行 |
+| `VersionEvent` | version, event_type, agent, stage, summary, detail, gate_verdict, scores, cost_usd, duration_seconds | 语义版本化的审计事件，用于时间线展示 |
+
+**只追加不变量**：`artifacts`、`gate_results`、`transitions`、`cost_records` 和 `timeline` 列表严格只追加。任何条目都不会被修改或删除。这使得 `state.json` 成为项目中所有事件的完整可审计日志——通过读取它可以精确重建智能体运行、门控评估、回滚和成本的完整序列。
+
+**原子写入协议**（`state.py:_save_state`）：
+
+```python
+def _save_state(self, state: ProjectState) -> None:
+    state_file = project_dir / "state.json"
+    tmp_file   = project_dir / "state.json.tmp"
+    # 1. 序列化到临时文件
+    tmp_file.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+    # 2. 原子重命名（POSIX 保证同文件系统上的 rename 是原子的）
+    tmp_file.replace(state_file)
+```
+
+如果进程在步骤 1 崩溃，`state.json` 不受影响。如果在步骤 2 崩溃，重命名是原子的——文件要么是旧版本要么是新版本，永不会是部分写入。无需 WAL、日志或锁即可消除数据损坏。
+
+**语义版本化**（`ProjectState.current_version`）：
+
+```
+Version = {stage_index}.{iteration_count}
+示例: "2.3" = 第 2 阶段 (hypothesis_formation), 第 3 次迭代
+```
+
+版本号是计算得出的，不是存储的——从 `current_stage` 和 `iteration_count` 派生。时间线中的每个 `VersionEvent` 都记录这个版本号，形成人类可读的审计追踪。
+
+#### 第二层：制品文件 — 智能体间通信通道
+
+智能体**仅通过**磁盘上的版本化 YAML 文件进行通信。每个制品都有一个从类型和版本号推导的规范路径。
+
+**存储布局：**
+
+```
+projects/<project-id>/
+└── artifacts/
+    ├── problem_definition/
+    │   └── problem_brief_v1.yaml          # 研究者输出，迭代 1
+    ├── literature_review/
+    │   ├── literature_map_v1.yaml          # 首次尝试
+    │   ├── literature_map_v2.yaml          # 评审反馈后修订
+    │   └── evidence_table_v1.yaml
+    ├── implementation/
+    │   ├── code_v1.yaml                    # 工程师代码（YAML 包装）
+    │   ├── test_result_v1.yaml             # 工程师草稿
+    │   └── test_result_v2.yaml             # 编排器 **已验证** 结果
+    └── ...
+```
+
+**规范路径推导**（`artifacts.py:create_artifact`）：
+
+路径**始终**从 `artifact_type + 计算版本号` 推导，而非智能体写入的文件名。这防止了 state.json 记录版本 N 但磁盘文件是版本 M 的关键 bug 类别：
+
+```python
+canonical = f"{artifact_type.value}_v{version}.yaml"
+rel_path  = f"artifacts/{stage.value}/{canonical}"
+```
+
+如果智能体写入非规范文件名，`register_artifact_file` 会将文件重命名以匹配。
+
+**不可变性**：制品永不被覆写。修订总是创建 `_v{N+1}`。`state.latest_artifact(type)` 方法返回给定类型的最高版本制品，但所有先前版本保留在磁盘上作为历史记录。
+
+**Schema 强制**（`schemas/*.schema.yaml`）：
+
+14 种制品类型各有一个 YAML Schema，定义结构约束（必需字段、字段类型、最小列表长度）。门控系统在任何 AI 评审**之前**验证每个制品是否符合其 Schema，以零 token 成本捕获结构性失败。
+
+#### 第三层：落盘代码 — 从 YAML 到可执行文件
+
+`code` 制品较为特殊。它将源代码文件存储在 **YAML 包装器内部**：
+
+```yaml
+# artifacts/implementation/code_v1.yaml
+files:
+  - path: experiments/train.py
+    content: |
+      import torch
+      from datasets import load_dataset
+      ...
+  - path: experiments/test_model.py
+    content: |
+      def test_forward_pass():
+      ...
+```
+
+编排器将 YAML **落盘**为真实文件（`execution.py:materialize_code`）：
+
+```
+projects/<id>/experiments/train.py       ← 从 code_v1.yaml 提取
+projects/<id>/experiments/test_model.py  ← 从 code_v1.yaml 提取
+```
+
+落盘后，编排器独立运行 `pytest` 和 `run_manifest` 中的冒烟测试。结果以**已验证**的 `test_result` 和 `metrics` 制品写回（带 `verified_by: orchestrator` 元数据），覆盖工程师产出的草稿制品。这是核心的防伪造机制——评审者审查的是编排器的已验证输出，而非工程师的自报结果。
+
+#### 第四层：执行日志 — 原始进程输出
+
+```
+projects/<id>/logs/
+├── problem_definition-a1b2c3.txt    # 智能体调度的原始 stdout/stderr
+├── experiment_execution.txt          # 冒烟测试 / 实验输出
+└── ...
+```
+
+日志文件捕获每个智能体子进程和实验执行的完整原始输出。它们仅用于参考——流水线不解析日志（判定解析使用结构化 YAML 输出），但对于调试失败不可或缺。
+
+#### 第五层：配置文件 — 流水线行为
+
+配置分布在两个人类可编辑的 YAML 文件中：
+
+**`config/settings.yaml`** — 运行时配置（智能体后端/模型、流水线参数、成本限制）  
+**`config/stages.yaml`** — 阶段定义（门控标准、回滚规则，结构性定义，很少变更）
+
+Web GUI 可通过 `/api/config` REST 端点在运行时修改 `settings.yaml`，更改在下一个流水线步骤立即生效，无需重启。
+
+#### 数据流总览
+
+```
+ ┌───────────────────────────────────────────────────────────────────────┐
+ │                    config/settings.yaml + stages.yaml                │
+ │                   （调度时读取，支持热重载）                             │
+ └──────────────────────────────┬────────────────────────────────────────┘
+                                │
+                                ▼
+ ┌──────────────────── Python 编排器 ────────────────────────────────────┐
+ │  1. 加载 state.json                                                   │
+ │  2. 读取配置 → 确定智能体、后端、模型                                    │
+ │  3. 从前序制品组装上下文                                                │
+ │  4. 构建 TaskCard (YAML)                                              │
+ │  5. 调度智能体子进程                                                    │
+ │     ├── 智能体将制品 YAML 写入 artifacts/<stage>/                       │
+ │     └── 原始输出保存到 logs/                                           │
+ │  6. 在 state.artifacts[] 中注册制品                                    │
+ │  7. [实现阶段] 落盘代码 → experiments/                                  │
+ │  8. [实现阶段] 运行 pytest → 写入已验证 test_result                     │
+ │  9. 调度评审者 → 审查制品                                               │
+ │ 10. 解析判定、评分、failure_type                                       │
+ │ 11. 追加 GateResult 到 state.gate_results[]                           │
+ │ 12. 追加 VersionEvent 到 state.timeline[]                             │
+ │ 13. 追加 StageTransition 到 state.transitions[]                       │
+ │ 14. 原子保存 state.json                                                │
+ │ 15. 循环或推进                                                         │
+ └───────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┼───────────────┐
+                    ▼           ▼               ▼
+              state.json   artifacts/       experiments/
+             （中央状态） （YAML 文件，    （落盘的源代码）
+                          不可变，版本化）
+```
+
+#### 为什么选择基于文件而非数据库？
+
+1. **Git 友好**：每次状态变更都是文件 diff。`git log` 即可查看项目历史，`git diff state.json` 精确显示变更内容
+2. **零基础设施**：不需要 PostgreSQL、Redis 或 Docker。`pip install` 即可运行
+3. **智能体兼容**：LLM 智能体原生支持 Read/Write 文件，无需 ORM、SQL 或 API 客户端
+4. **可调试**：`cat state.json | jq '.timeline[-1]'` 查看最新事件，`cat artifacts/.../code_v1.yaml` 查看工程师写的完整代码，无需查询语言
+5. **可移植**：复制 `projects/<id>/` 目录即拥有完整项目——状态、制品、代码、日志全在一处
+6. **防崩溃**：原子 tmp+rename 写入在无事务的情况下防止数据损坏
 
 ### Web 图形界面
 
