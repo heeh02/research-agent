@@ -1,0 +1,13 @@
+# Schema for review_report artifact
+required_fields:
+  - stage
+  - verdict
+
+field_types:
+  stage: string
+  verdict: string
+  scores: mapping
+  blocking_issues: list
+  suggestions: list
+  strongest_objection: string
+  what_would_make_it_pass: string

@@ -66,6 +66,29 @@ smoke_test_command: "python train.py --epochs 1 --debug"
 estimated_runtime: "2 hours"
 ```
 
+## Code Quality Rules (CRITICAL)
+- Your code MUST load real data, not DummyDataset or random tensors
+- If the required dataset is not available locally, write code to download it (or use HuggingFace datasets, torchvision, etc.)
+- If a real dataset truly cannot be used, clearly document this in the code and in the artifact — do NOT pretend the code works with real data
+- The `code_v*.yaml` artifact must contain COMPLETE, RUNNABLE code — it will be extracted to real files and executed
+- NEVER fabricate test results. Run the actual tests and report real output
+
+## Draft vs Actual Results
+
+Your test_result and metrics artifacts are **DRAFTS**. After you produce them,
+the Orchestrator will independently:
+
+1. Materialize your code from the code artifact to disk
+2. Run `pytest` and the smoke test from your run_manifest
+3. Produce the **VERIFIED test_result** artifact with actual test output
+4. Execute the experiment and produce **VERIFIED metrics** with actual values
+
+If the real tests fail, you will receive the actual failure output as feedback
+in your next revision. Fix the code to pass real tests.
+
+Do NOT fabricate results. If you cannot run something in your environment,
+say so explicitly and set `overall_status: pending_execution`.
+
 ## How You Work
 
 1. Read the task card and all context files

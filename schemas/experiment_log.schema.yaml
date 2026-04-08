@@ -1,0 +1,12 @@
+# Schema for experiment_log artifact
+required_fields:
+  - experiment_name
+  - runs
+
+field_types:
+  experiment_name: string
+  runs: list
+  summary: string
+
+min_lengths:
+  runs: 1

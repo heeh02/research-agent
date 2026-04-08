@@ -36,20 +36,38 @@ from research_agent.models import (
     STAGE_REQUIRED_ARTIFACTS,
     AgentRole,
     ArtifactType,
+    CLIBackend,
+    CostRecord,
     GateCheck,
     GateResult,
     GateStatus,
+    LLMProvider,
     Stage,
     VersionEventType,
 )
 from research_agent.state import StateManager
-from research_agent.artifacts import create_artifact
+from research_agent.artifacts import create_artifact, register_artifact_file, load_schema, validate_artifact_content
 from research_agent.dispatcher import MultiAgentDispatcher, TaskCard, AgentResult
+from research_agent.verdict import (
+    evaluate_rollback,
+    parse_failure_type, FAILURE_TYPE_CROSS_STAGE,
+)
+from research_agent.gate_eval import evaluate_gate_verdict
+from research_agent.prechecks import pre_review_checks, verify_backend_capabilities
+from research_agent.execution import (
+    materialize_code, execute_experiment,
+    run_and_record_tests, run_and_record_experiment,
+)
 
 
 def load_config() -> dict:
     f = ROOT / "config" / "settings.yaml"
-    return yaml.safe_load(f.read_text()) if f.exists() else {}
+    cfg = yaml.safe_load(f.read_text()) if f.exists() else {}
+    # Also load stages.yaml for gate criteria and thresholds
+    stages_f = ROOT / "config" / "stages.yaml"
+    if stages_f.exists():
+        cfg["_stages"] = yaml.safe_load(stages_f.read_text()) or {}
+    return cfg
 
 
 def get_active(sm: StateManager) -> str:
@@ -188,6 +206,14 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
                 return AgentResult(task_id="skipped", role=role, success=False, output_text="Skipped by user"), "Skipped"
 
     state = sm.load_project(project_id)
+
+    # Backend capability warnings
+    backend = dispatcher.backends.get(role)
+    if backend:
+        warnings = verify_backend_capabilities(backend, role, stage)
+        for w in warnings:
+            print(f"  ⚠ {w}")
+
     previous_feedback = ""
     stage_gates = [g for g in state.gate_results if g.stage == stage]
     if stage_gates and stage_gates[-1].status == GateStatus.FAILED:
@@ -220,31 +246,165 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
 
     icon = "✓" if result.success else "✗"
     retry_str = f" (retried {result.retries}x)" if result.retries > 0 else ""
-    print(f"┌─ {icon} v{ver} Agent done ({result.duration_seconds:.1f}s){retry_str}")
+    cost_str = f" ${result.cost_usd:.4f}" if result.cost_usd > 0 else ""
+    src_str = f" [{result.cost_source}]" if result.cost_source != "unknown" else ""
+    print(f"┌─ {icon} v{ver} Agent done ({result.duration_seconds:.1f}s){retry_str}{cost_str}{src_str}")
     print(f"│  Files: {result.output_files}")
+    if result.input_tokens > 0:
+        print(f"│  Tokens: {result.input_tokens:,} in / {result.output_tokens:,} out")
     print(f"└─")
     print()
 
-    # Record event + register artifacts
+    # --- Validate and register artifacts BEFORE recording the event ---
     state = sm.load_project(project_id)
+    project_dir = ROOT / "projects" / project_id
+    registered_count = 0
+    registered_types: set[ArtifactType] = set()
+    accepted_files: list[str] = []
+
+    for output_path in result.output_files:
+        for atype in ArtifactType:
+            if atype.value in Path(output_path).stem:
+                op = Path(output_path)
+                if op.is_absolute():
+                    actual = op
+                elif str(op).startswith("projects/"):
+                    actual = ROOT / op
+                else:
+                    actual = project_dir / op
+
+                if not actual.exists():
+                    print(f"  SKIP: {atype.value} — file not found: {actual}")
+                    break
+
+                try:
+                    raw = actual.read_text(encoding="utf-8")
+                    yaml.safe_load(raw)
+                except yaml.YAMLError as e:
+                    print(f"  REJECT: {atype.value} — invalid YAML: {e}")
+                    break
+
+                schema = load_schema(ROOT / "schemas", atype)
+                if schema:
+                    errors = validate_artifact_content(raw, schema)
+                    if errors:
+                        print(f"  REJECT: {atype.value} — schema errors: {errors[:3]}")
+                        break
+
+                provenance = {
+                    "backend": dispatcher.backends.get(role, "claude").value
+                        if hasattr(dispatcher.backends.get(role, "claude"), "value")
+                        else str(dispatcher.backends.get(role, "claude")),
+                    "model": dispatcher.models.get(role, "unknown"),
+                    "duration_seconds": result.duration_seconds,
+                    "exit_code": result.exit_code,
+                    "iteration": state.current_iteration(),
+                }
+                art = register_artifact_file(
+                    state, atype, stage, role, actual, project_dir, metadata=provenance,
+                )
+                registered_count += 1
+                registered_types.add(atype)
+                # Use canonical path (register may have renamed the file)
+                accepted_files.append(f"projects/{project_id}/{art.path}")
+                break
+
+    # --- Post-validation: update result to reflect what was actually registered ---
+
+    # All output files rejected → treat as "no output" (triggers retry in callers)
+    if result.output_files and registered_count == 0:
+        result.success = False
+        result.output_files = []
+        result.error = "All output files rejected by validation"
+        print(f"  ✗ All output file(s) rejected — step marked failed")
+    else:
+        # Narrow output_files to only accepted files
+        result.output_files = accepted_files
+
+    # Check THIS dispatch's completeness (not historical artifacts)
+    required_types = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+    if required_types and registered_count > 0:
+        missing = [at.value for at in required_types if at not in registered_types]
+        if missing:
+            result.success = False
+            result.error = f"Missing required artifacts: {missing}"
+            print(f"  ⚠ Incomplete: missing {missing} — proceeding to review for feedback")
+
+    # --- NOW record event with accurate post-validation data ---
     state.record_event(
         VersionEventType.AGENT_RUN,
-        f"{role.value} produced artifacts for {stage.value}",
+        f"{role.value} → {', '.join(Path(p).name for p in accepted_files) or 'no valid artifacts'}",
         agent=role,
-        artifacts_produced=result.output_files,
+        artifacts_produced=accepted_files,
         cost_usd=result.cost_usd,
         duration_seconds=result.duration_seconds,
         detail=result.output_text,
     )
 
-    for output_path in result.output_files:
-        for atype in ArtifactType:
-            if atype.value in Path(output_path).stem:
-                create_artifact(state, atype, stage, role, Path(output_path).name)
-                break
+    # Record cost
+    if result.cost_usd > 0:
+        backend_enum = dispatcher.backends.get(role, CLIBackend.CLAUDE)
+        provider_map = {
+            CLIBackend.CLAUDE: LLMProvider.CLAUDE,
+            CLIBackend.CODEX: LLMProvider.CODEX,
+            CLIBackend.OPENCODE: LLMProvider.OPENCODE,
+        }
+        cost_desc = f"{role.value}/{stage.value}"
+        if result.cost_source == "estimated":
+            cost_desc += " (estimated)"
+        state.cost_records.append(CostRecord(
+            agent=role,
+            provider=provider_map.get(backend_enum, LLMProvider.CLAUDE),
+            model=dispatcher.models.get(role, "unknown"),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=result.cost_usd,
+            task_description=cost_desc,
+            stage=stage,
+        ))
+
+    # Record isolation violations
+    if result.violations:
+        print(f"  ⚠ ISOLATION: {len(result.violations)} violation(s):")
+        for vp in result.violations:
+            print(f"    - {vp}")
+        state.record_event(
+            VersionEventType.ISOLATION_VIOLATION,
+            f"{role.value} wrote {len(result.violations)} unauthorized file(s)",
+            agent=role,
+            detail="\n".join(result.violations),
+        )
 
     sm.save_project(state)
     return result, f"v{ver} {role.value} → {stage.value}"
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator validation — runs BEFORE critic review
+# ---------------------------------------------------------------------------
+
+def run_orchestrator_validation(sm, project_id, stage, base_dir, log_fn=print):
+    """Orchestrator step: validate YAML, materialize code, run tests/experiments.
+
+    Called AFTER agent produces artifacts, BEFORE critic reviews.
+    Writes verified test_result/metrics artifacts that override agent drafts.
+    """
+    state = sm.load_project(project_id)
+
+    if stage == Stage.IMPLEMENTATION:
+        log_fn("  [Orchestrator] Materializing code and running tests...")
+        test_result = run_and_record_tests(state, sm, project_id, base_dir, log_fn)
+        icon = "PASS" if test_result.get("passed") else "FAIL"
+        log_fn(f"  [Orchestrator] Tests: {icon}")
+        return test_result
+
+    if stage == Stage.EXPERIMENTATION:
+        log_fn("  [Orchestrator] Executing experiment and recording metrics...")
+        exp_result = run_and_record_experiment(state, sm, project_id, base_dir, log_fn)
+        log_fn(f"  [Orchestrator] Metrics: {len(exp_result.get('metrics', {}))} values parsed")
+        return exp_result
+
+    return {"success": True, "details": "No orchestrator action for this stage"}
 
 
 def run_review(sm, dispatcher, project_id, auto_mode=False):
@@ -256,7 +416,15 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     from research_agent.agents.critic import STAGE_REVIEW_CRITERIA
     criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
 
-    # Build proper review instruction so non-codex critics know the expected format
+    # Build stage-specific score keys from stages.yaml
+    config = load_config()
+    stages_cfg = config.get("_stages", {}).get("stages", {}).get(stage.value, {})
+    score_keys_list = [c["name"] for c in stages_cfg.get("gate_criteria", []) if "name" in c]
+    if score_keys_list:
+        score_line = "scores:  # score each 0.0-1.0\n" + "".join(f"  {k}: 0.0-1.0\n" for k in score_keys_list)
+    else:
+        score_line = "scores: {rigor, completeness, clarity, novelty} each 0.0-1.0\n"
+
     review_instr = (
         f"CRITICAL: You are a REVIEWER. Do NOT write any files. Do NOT create v2 artifacts.\n"
         f"ONLY output a review YAML block.\n\n"
@@ -264,13 +432,23 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
         f"## Review Criteria\n{criteria}\n\n"
         f"## Required Output (print YAML, do NOT write files)\n"
         f"verdict: PASS | REVISE | FAIL\n"
-        f"scores: {{rigor, completeness, clarity, novelty}} each 0.0-1.0\n"
+        f"failure_type: (required if REVISE/FAIL) one of: structural_issue, implementation_bug, "
+        f"design_flaw, hypothesis_needs_revision, evidence_insufficient, hypothesis_falsified, analysis_gap\n"
+        f"{score_line}"
         f"blocking_issues: [list]\n"
         f"suggestions: [list]\n"
         f"strongest_objection: str\n"
         f"what_would_make_it_pass: str\n\n"
         f"PASS only if ALL scores >= 0.7 AND no blocking issues.\n"
     )
+
+    # Tell critic that Orchestrator has verified test_result / metrics
+    if stage in (Stage.IMPLEMENTATION, Stage.EXPERIMENTATION):
+        review_instr += (
+            f"\n## Orchestrator Execution Results\n"
+            f"The test_result and metrics artifacts have been VERIFIED by the Orchestrator "
+            f"through actual code execution. Review the ACTUAL results, not agent claims.\n"
+        )
     task = build_task_card(state, stage, AgentRole.CRITIC, project_id, review_instr)
 
     critic_backend = dispatcher.backends.get(AgentRole.CRITIC, "codex")
@@ -303,16 +481,29 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
         sm.save_project(state)
         return result, gate_result
 
-    verdict = "REVISE"
-    upper_out = result.output_text.upper()
-    if result.success:
-        verdict = "PASS"
-    elif "VERDICT: PASS" in upper_out or "VERDICT:PASS" in upper_out:
-        verdict = "PASS"
-    elif any(v in upper_out for v in ["VERDICT: FAIL", "VERDICT:FAIL", "VERDICT: REJECT", "VERDICT:REJECT"]):
-        verdict = "FAIL"
-    elif any(v in upper_out for v in ["VERDICT: REVISE", "VERDICT:REVISE"]):
-        verdict = "REVISE"
+    # --- Layered gate evaluation (shared module) ---
+    pre_issues = pre_review_checks(state, stage, sm, project_id, ROOT)
+
+    config = load_config()
+    stage_cfg = config.get("_stages", {}).get("stages", {}).get(stage.value, {})
+    stage_criteria = stage_cfg.get("gate_criteria", []) if stage_cfg else []
+    threshold = stage_cfg.get("pass_threshold", 0.7) if stage_cfg else 0.7
+
+    gv = evaluate_gate_verdict(
+        result.output_text, result.success,
+        pre_issues, stage_criteria, threshold,
+    )
+    verdict = gv.verdict
+
+    if pre_issues:
+        print(f"  Pre-check issues found:")
+        for iss in pre_issues:
+            print(f"    - {iss}")
+    if gv.pre_check_override:
+        print(f"  Pre-check override: PASS → REVISE ({len(pre_issues)} blocking issue(s))")
+        result.output_text += gv.annotation
+    if gv.score_override:
+        print(f"  Weighted score {gv.weighted_avg:.2f} < {threshold} — overriding PASS → REVISE")
 
     gate_result = GateResult(
         gate_name=f"{stage.value}_codex_review",
@@ -330,6 +521,27 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
 
     state = sm.load_project(project_id)
     state.gate_results.append(gate_result)
+    # Record review cost
+    if result.cost_usd > 0:
+        backend_enum = dispatcher.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
+        provider_map = {
+            CLIBackend.CLAUDE: LLMProvider.CLAUDE,
+            CLIBackend.CODEX: LLMProvider.CODEX,
+            CLIBackend.OPENCODE: LLMProvider.OPENCODE,
+        }
+        cost_desc = f"critic/{stage.value}"
+        if result.cost_source == "estimated":
+            cost_desc += " (estimated)"
+        state.cost_records.append(CostRecord(
+            agent=AgentRole.CRITIC,
+            provider=provider_map.get(backend_enum, LLMProvider.CLAUDE),
+            model=dispatcher.models.get(AgentRole.CRITIC, "unknown"),
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            cost_usd=result.cost_usd,
+            task_description=cost_desc,
+            stage=stage,
+        ))
     evt = VersionEventType.GATE_PASSED if verdict == "PASS" else VersionEventType.GATE_FAILED
     state.record_event(
         evt,
@@ -376,10 +588,12 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
         print(f"  v{ver}  STAGE: {stage.value}")
         print(f"{'='*60}\n")
 
+        cross_stage_rollback = False  # Set by inner loop if failure_type is cross-stage
+
         for rev in range(max_revisions + 1):
+            # 1. Agent produces artifacts
             result, _ = run_step(sm, dispatcher, project_id, instruction, auto_mode=True)
 
-            # Auth error → stop entire auto pipeline, let user fix
             if result.is_auth_error:
                 print(f"\n  ✗ Pipeline paused: authentication error.")
                 print(f"  ✗ Fix with: /login  or  claude login")
@@ -389,9 +603,12 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
             if not result.success and not result.output_files:
                 continue
 
+            # 2. Orchestrator validates + executes (BEFORE critic review)
+            run_orchestrator_validation(sm, project_id, stage, ROOT, log_fn=print)
+
+            # 3. Critic reviews ACTUAL results
             codex_result, gate_result = run_review(sm, dispatcher, project_id, auto_mode=True)
 
-            # Codex auth error → stop
             if codex_result.is_auth_error:
                 print(f"\n  ✗ Pipeline paused: Codex authentication error.")
                 print(f"  ✗ Fix with: codex login")
@@ -400,9 +617,15 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
 
             if gate_result and gate_result.status == GateStatus.PASSED:
                 break
+
+            # 4. Check failure_type for cross-stage rollback
+            ft = parse_failure_type(gate_result.overall_feedback if gate_result else "")
+            if ft and ft in FAILURE_TYPE_CROSS_STAGE:
+                cross_stage_rollback = True
+                break  # Exit inner loop — outer loop handles rollback
+
+            # Same-stage revise: continue inner loop
             if rev < max_revisions:
-                # Increment iteration count so version number advances (v0.1 → v0.2)
-                # and max_iterations gate check works
                 state = sm.load_project(project_id)
                 state.increment_iteration()
                 sm.save_project(state)
@@ -414,6 +637,20 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
         latest = gates[-1] if gates else None
 
         if latest and latest.status != GateStatus.PASSED:
+            # --- Automatic backward transition evaluation ---
+            max_iters = config.get("pipeline", {}).get("max_iterations", 5)
+            rollback_target = evaluate_rollback(
+                state, stage, latest, max_iters,
+                state_manager=sm, project_id=project_id,
+            )
+            if rollback_target:
+                trigger = ALLOWED_TRANSITIONS.get((stage, rollback_target), "auto_rollback")
+                state.record_transition(rollback_target, trigger, gate_result=latest,
+                                        notes=f"Auto-rollback from {stage.value}")
+                sm.save_project(state)
+                print(f"\n  ↩ Auto-rollback: {stage.value} → {rollback_target.value}")
+                instruction = ""
+                continue  # Re-enter while loop at rolled-back stage
             print(f"\n  ✗ Gate not passed for {stage.value}.")
             print(f"  ✗ Fix issues, then resume: python scripts/multi_agent.py auto")
             break
@@ -428,6 +665,23 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
                 f"Human gate: awaiting approval at {stage.value}")
             sm.save_project(state)
             print(f"\n  Human gate at {stage.value}. Run: ra advance --approve")
+            break
+
+        # Pre-advance completeness gate: every required artifact type must have
+        # a version produced in the CURRENT iteration (not carried over from old runs).
+        state = sm.load_project(project_id)
+        cur_iter = state.current_iteration()
+        required = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+        advance_missing = []
+        for at in required:
+            lat = state.latest_artifact(at)
+            if not lat:
+                advance_missing.append(at.value)
+            elif lat.metadata.get("iteration", 0) < cur_iter:
+                advance_missing.append(f"{at.value} (stale v{lat.version}, iteration {lat.metadata.get('iteration', '?')} < {cur_iter})")
+        if advance_missing:
+            print(f"\n  ✗ Cannot advance: missing/stale artifacts: {advance_missing}")
+            print(f"  ✗ Re-run step to produce fresh versions.")
             break
 
         idx = STAGE_ORDER.index(stage)
@@ -459,15 +713,32 @@ def run_advance_step(sm, dispatcher, project_id, instruction=""):
         print("Agent produced no output.")
         return
 
-    # Run review
+    # Orchestrator validates + executes (BEFORE critic review)
+    run_orchestrator_validation(sm, project_id, stage, ROOT, log_fn=print)
+
+    # Run review (critic now sees actual results)
     _, gate_result = run_review(sm, dispatcher, project_id, auto_mode=False)
 
     if not gate_result or gate_result.status != GateStatus.PASSED:
         print(f"\nGate not passed. Address feedback and run step again.")
         return
 
-    # Confirm major version bump (stage advance)
+    # Pre-advance completeness gate: iteration-aware
     state = sm.load_project(project_id)
+    cur_iter = state.current_iteration()
+    required = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+    advance_missing = []
+    for at in required:
+        lat = state.latest_artifact(at)
+        if not lat:
+            advance_missing.append(at.value)
+        elif lat.metadata.get("iteration", 0) < cur_iter:
+            advance_missing.append(f"{at.value} (stale)")
+    if advance_missing:
+        print(f"\n  ✗ Cannot advance: missing/stale artifacts: {advance_missing}")
+        return
+
+    # Confirm major version bump (stage advance)
     idx = STAGE_ORDER.index(stage)
     if idx < len(STAGE_ORDER) - 1:
         nxt = STAGE_ORDER[idx + 1]
@@ -522,6 +793,7 @@ def show_timeline(sm, project_id):
             VersionEventType.HUMAN_APPROVE: "👤✓",
             VersionEventType.HUMAN_REJECT: "👤✗",
             VersionEventType.HUMAN_FEEDBACK: "👤💬",
+            VersionEventType.ISOLATION_VIOLATION: "⚠",
         }.get(ev.event_type, "·")
 
         agent_str = f"[{ev.agent.value}]" if ev.agent else ""
@@ -602,6 +874,15 @@ def main():
 
     config = load_config()
     sm = StateManager(ROOT)
+
+    # GUI can start without an active project (it has its own project management)
+    if args.command == "gui":
+        from research_agent.gui import run_gui
+        af = ROOT / ".active_project"
+        project_id = af.read_text().strip() if af.exists() else None
+        run_gui(sm, project_id, config, port=args.port)
+        return
+
     project_id = get_active(sm)
     dispatcher = MultiAgentDispatcher(ROOT, ROOT / "agents", config)
 
@@ -616,9 +897,6 @@ def main():
         run_auto(sm, dispatcher, project_id, until, args.max_revisions, args.instruction)
     elif args.command == "timeline":
         show_timeline(sm, project_id)
-    elif args.command == "gui":
-        from research_agent.gui import run_gui
-        run_gui(sm, project_id, config, port=args.port)
 
 
 if __name__ == "__main__":

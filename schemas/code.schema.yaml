@@ -1,0 +1,18 @@
+# Schema for code artifact
+required_fields:
+  - files
+
+field_types:
+  files: list
+  language: string
+  entry_point: string
+  dependencies: list
+
+min_lengths:
+  files: 1
+
+# Each file entry must have path and content (code must be materializable)
+list_item_fields:
+  files:
+    - path
+    - content

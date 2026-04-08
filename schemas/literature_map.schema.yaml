@@ -21,3 +21,15 @@ min_lengths:
   papers: 5
   identified_gaps: 2
   recommended_baselines: 2
+
+min_string_lengths:
+  research_question: 20
+  search_scope: 10
+
+# Every paper must have title and url (papers without URLs are rejected)
+list_item_fields:
+  papers:
+    - title
+    - url
+  identified_gaps:
+    - description

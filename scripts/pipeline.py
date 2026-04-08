@@ -365,6 +365,72 @@ def cmd_context(args):
 
 
 # ---------------------------------------------------------------------------
+# Repair — fix version/path mismatches and remove invalid artifacts
+# ---------------------------------------------------------------------------
+
+def cmd_repair(args):
+    """Repair state.json: fix artifact version/path mismatches, remove invalid entries."""
+    sm = StateManager(ROOT / "projects")
+    project_id = get_active(sm)
+    state = sm.load_project(project_id)
+    project_dir = ROOT / "projects" / project_id
+
+    fixed = 0
+    removed = 0
+    valid_artifacts = []
+
+    for art in state.artifacts:
+        art_path = project_dir / art.path
+        # Check 1: file exists
+        if not art_path.exists():
+            print(f"  REMOVE: {art.name} — file not found: {art.path}")
+            removed += 1
+            continue
+
+        # Check 2: valid YAML
+        try:
+            raw = art_path.read_text(encoding="utf-8")
+            yaml.safe_load(raw)
+        except Exception as e:
+            print(f"  REMOVE: {art.name} — invalid YAML: {e}")
+            removed += 1
+            continue
+
+        # Check 3: version/path consistency
+        expected_filename = f"{art.artifact_type.value}_v{art.version}.yaml"
+        expected_path = f"artifacts/{art.stage.value}/{expected_filename}"
+        if art.path != expected_path:
+            # Try to rename file to match version
+            expected_full = project_dir / expected_path
+            if not expected_full.exists():
+                art_path.rename(expected_full)
+                print(f"  FIX: {art.name} — renamed {art.path} → {expected_path}")
+                art.path = expected_path
+                fixed += 1
+            else:
+                print(f"  REMOVE: {art.name} — path mismatch and target exists: {art.path} ≠ {expected_path}")
+                removed += 1
+                continue
+
+        valid_artifacts.append(art)
+
+    # Deduplicate: keep only latest version of each type
+    seen: dict[str, int] = {}
+    deduped = []
+    for art in reversed(valid_artifacts):
+        key = art.artifact_type.value
+        if key not in seen or art.version > seen[key]:
+            seen[key] = art.version
+        deduped.append(art)
+    deduped.reverse()
+
+    state.artifacts = deduped
+    sm.save_project(state)
+
+    print(f"\nRepair complete: {fixed} fixed, {removed} removed, {len(deduped)} artifacts retained.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -399,6 +465,7 @@ def main():
     p_val.add_argument("file")
 
     sub.add_parser("context", help="Output assembled context")
+    sub.add_parser("repair", help="Fix artifact version/path mismatches and remove invalid entries")
 
     args = parser.parse_args()
     if not args.command:
@@ -415,6 +482,7 @@ def main():
         "cost": cmd_cost,
         "validate": cmd_validate,
         "context": cmd_context,
+        "repair": cmd_repair,
     }[args.command](args)
 
 

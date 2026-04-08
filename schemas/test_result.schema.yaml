@@ -1,0 +1,11 @@
+# Schema for test_result artifact
+required_fields:
+  - test_summary
+  - overall_status
+
+field_types:
+  test_summary: string
+  overall_status: string
+  passed_tests: list
+  failed_tests: list
+  test_output: string

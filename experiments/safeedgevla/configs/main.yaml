@@ -1,0 +1,10 @@
+experiment_name: "SafeEdgeVLA"
+training:
+  epochs: 3
+  batch_size: 256
+  lr: 3.0e-4
+  weight_decay: 0.01
+  gradient_clip: 1.0
+model:
+  parameter_size: "780M"
+output_dir: "experiments/safeedgevla/results"

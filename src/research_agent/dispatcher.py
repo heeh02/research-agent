@@ -21,7 +21,16 @@ from typing import Any, Optional
 
 import yaml
 
-from .models import AgentRole, CLIBackend, CostRecord, LLMProvider, ProjectState, Stage
+from .models import (
+    AgentRole, ArtifactType, CLIBackend, CostRecord, LLMProvider,
+    ProjectState, Stage, STAGE_REQUIRED_ARTIFACTS,
+)
+from .sandbox import (
+    FileSnapshot,
+    ViolationReport,
+    check_violations,
+    snapshot_directory,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +118,13 @@ class AgentResult:
     error: str = ""
     duration_seconds: float = 0.0
     cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_source: str = "unknown"  # "claude_cli", "estimated", "unknown"
     exit_code: int = 0
     retries: int = 0
     is_auth_error: bool = False
+    violations: list[str] = field(default_factory=list)  # Isolation violation paths
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +192,7 @@ class MultiAgentDispatcher:
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ENGINEER]),
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ORCHESTRATOR]),
         }
+        self._active_proc = None  # Track running subprocess for force-kill
         self.max_turns: dict[AgentRole, int] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ENGINEER]),
@@ -216,8 +230,19 @@ class MultiAgentDispatcher:
                 constraints=task.constraints, metadata=task.metadata,
             )
 
+        # Snapshot project dir before dispatch (for violation detection)
+        pid = task.metadata.get("project_id", "")
+        snap_before: FileSnapshot | None = None
+        if pid:
+            snap_before = snapshot_directory(self.project_dir, pid)
+
         last_result = None
         for attempt in range(self.max_retries + 1):
+            cost_usd = 0.0
+            in_tokens = 0
+            out_tokens = 0
+            cost_source = "unknown"
+
             start = time.time()
             try:
                 if backend == CLIBackend.OPENCODE:
@@ -227,8 +252,14 @@ class MultiAgentDispatcher:
                         progress_fn=progress_fn,
                         cancel_event=cancel_event,
                     )
+                    # OpenCode has no usage data — estimate from text length
+                    cost_usd, in_tokens, out_tokens = self._estimate_cost_from_text(
+                        prompt, output, model)
+                    cost_source = "estimated"
                 else:
-                    output, exit_code = self._run_claude(prompt, toolset, model, effort)
+                    output, exit_code, cost_usd, in_tokens, out_tokens = self._run_claude(
+                        prompt, toolset, model, effort)
+                    cost_source = "claude_cli" if cost_usd > 0 else "unknown"
             except subprocess.TimeoutExpired:
                 output = f"ERROR: {backend.value} process timed out"
                 exit_code = 124
@@ -248,12 +279,24 @@ class MultiAgentDispatcher:
                 time.sleep(wait)
                 continue
 
-            output_files = self._detect_output_files(task, output)
-            # Critic success = has verdict in output (no files needed)
+            output_files = self._detect_output_files(task, output, dispatch_start=start)
+            # Critic success = process completed (NOT verdict approval).
+            # Verdict interpretation belongs in the caller (run_review / _do_review).
             if is_critic:
-                success = exit_code == 0 or "verdict:" in output.lower()
+                success = exit_code == 0 or bool(output.strip())
             else:
                 success = exit_code == 0 and bool(output_files)
+
+            # Check for isolation violations BEFORE saving our own log
+            # (the log is written by the orchestrator, not the agent)
+            violation_paths: list[str] = []
+            if snap_before and pid:
+                snap_after = snapshot_directory(self.project_dir, pid)
+                vr = check_violations(
+                    snap_before, snap_after, role, task.stage,
+                    task.required_outputs, pid,
+                )
+                violation_paths = [v.path for v in vr.violations]
 
             self._save_full_log(task, output)
 
@@ -261,8 +304,12 @@ class MultiAgentDispatcher:
                 task_id=task.task_id, role=role, success=success,
                 output_text=output, output_files=output_files,
                 error="" if success else f"Exit code: {exit_code}",
-                duration_seconds=duration, exit_code=exit_code,
+                duration_seconds=duration, cost_usd=cost_usd,
+                input_tokens=in_tokens, output_tokens=out_tokens,
+                cost_source=cost_source,
+                exit_code=exit_code,
                 retries=attempt, is_auth_error=_is_auth_error(output),
+                violations=violation_paths,
             )
             break
 
@@ -277,6 +324,67 @@ class MultiAgentDispatcher:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as executor:
             futures = {executor.submit(self.dispatch, t): t for t in tasks}
             return [f.result() for f in concurrent.futures.as_completed(futures)]
+
+    # -----------------------------------------------------------------------
+    # Cost parsing helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_claude_json(raw_json: str) -> tuple[str, int, float, int, int]:
+        """Parse Claude CLI JSON output.
+
+        Returns (result_text, exit_code_hint, cost_usd, input_tokens, output_tokens).
+        If parsing fails, returns the raw text as result with zero cost.
+        """
+        try:
+            data = json.loads(raw_json)
+        except (json.JSONDecodeError, ValueError):
+            return raw_json, -1, 0.0, 0, 0
+
+        result_text = data.get("result", "")
+        cost_usd = float(data.get("total_cost_usd", 0.0) or 0.0)
+        usage = data.get("usage", {})
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+
+        # Also count cache tokens as input for cost tracking completeness
+        input_tokens += int(usage.get("cache_creation_input_tokens", 0) or 0)
+        input_tokens += int(usage.get("cache_read_input_tokens", 0) or 0)
+
+        is_error = data.get("is_error", False)
+        exit_hint = 1 if is_error else 0
+
+        return result_text, exit_hint, cost_usd, input_tokens, output_tokens
+
+    @staticmethod
+    def _estimate_cost_from_text(prompt: str, output: str, model: str) -> tuple[float, int, int]:
+        """Rough cost estimate based on character count for backends without usage data.
+
+        Assumes ~4 chars per token. Returns (cost_usd, est_input_tokens, est_output_tokens).
+        Prices are approximate and may be stale.
+        """
+        est_input = max(len(prompt) // 4, 1)
+        est_output = max(len(output) // 4, 1)
+
+        # Conservative price per 1M tokens (input/output)
+        # These are rough mid-2025 prices; marked as "estimated" in results
+        price_table: dict[str, tuple[float, float]] = {
+            # (input_per_1M, output_per_1M)
+            "gpt-5.4": (2.50, 10.00),
+            "gpt-4.1": (2.00, 8.00),
+            "o4-mini": (1.10, 4.40),
+        }
+        # Default for unknown models (Doubao, DeepSeek, etc.)
+        default_price = (1.00, 4.00)
+
+        in_price, out_price = default_price
+        for prefix, prices in price_table.items():
+            if prefix in model.lower():
+                in_price, out_price = prices
+                break
+
+        cost = (est_input * in_price + est_output * out_price) / 1_000_000
+        return cost, est_input, est_output
 
     # -----------------------------------------------------------------------
     # Internal — Claude Code CLI
@@ -346,26 +454,51 @@ class MultiAgentDispatcher:
         }.get(role, AgentToolset.ENGINEER.value)
 
     def _run_claude(self, prompt: str, allowed_tools: str, model: str,
-                    effort: str = "high") -> tuple[str, int]:
+                    effort: str = "high") -> tuple[str, int, float, int, int]:
+        """Run Claude Code CLI. Returns (output, exit_code, cost_usd, in_tokens, out_tokens)."""
         cmd = [
             "claude", "-p",
-            "--output-format", "text",
+            "--output-format", "json",
             "--model", model,
             "--effort", effort,
             "--allowedTools", allowed_tools,
         ]
         timeout = 900 if effort == "max" else 600
-        result = subprocess.run(
-            cmd, input=prompt,
-            cwd=str(self.project_dir),
-            capture_output=True, text=True,
-            timeout=timeout,
+        # Use Popen (not run) so the process can be force-killed by stop()
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=str(self.project_dir),
+            start_new_session=True,
             env={**os.environ, "CLAUDE_CODE_ENTRYPOINT": "agent-dispatch"},
         )
-        output = result.stdout
-        if result.returncode != 0 and not output.strip():
-            output = result.stderr
-        return output, result.returncode
+        self._active_proc = proc
+        try:
+            stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), 9)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            stdout, stderr = proc.communicate()
+            raise
+        finally:
+            self._active_proc = None
+
+        # Parse JSON output for result text and usage data
+        raw = stdout
+        if proc.returncode != 0 and not raw.strip():
+            return stderr, proc.returncode, 0.0, 0, 0
+
+        result_text, exit_hint, cost_usd, in_tok, out_tok = self._parse_claude_json(raw)
+
+        # If JSON parsing failed (exit_hint == -1), fall back to raw stdout
+        if exit_hint == -1:
+            return raw, proc.returncode, 0.0, 0, 0
+
+        # Use proc.returncode as authoritative; exit_hint is only a fallback
+        exit_code = proc.returncode
+        return result_text, exit_code, cost_usd, in_tok, out_tok
 
     # -----------------------------------------------------------------------
     # Internal — OpenCode CLI
@@ -582,30 +715,75 @@ class MultiAgentDispatcher:
 
         self._save_full_log(task, result.raw_output)
 
+        # Codex CLI does not expose token usage — estimate from text
+        codex_model = self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4")
+        prompt_text = task.instruction + "\n".join(context_parts)
+        est_cost, est_in, est_out = self._estimate_cost_from_text(
+            prompt_text, result.raw_output, codex_model)
+
         return AgentResult(
             task_id=task.task_id, role=AgentRole.CRITIC,
             success=result.verdict == "PASS",
             output_text=result.raw_output,
             output_files=[str(review_path)],
             duration_seconds=duration,
+            cost_usd=est_cost, input_tokens=est_in, output_tokens=est_out,
+            cost_source="estimated",
         )
 
     # -----------------------------------------------------------------------
     # Shared helpers
     # -----------------------------------------------------------------------
 
-    def _detect_output_files(self, task: TaskCard, output: str) -> list[str]:
+    def _detect_output_files(self, task: TaskCard, output: str,
+                             dispatch_start: float | None = None) -> list[str]:
+        """Detect output files written by the agent during this dispatch.
+
+        Args:
+            dispatch_start: time.time() when the dispatch began. When set,
+                files with mtime < dispatch_start are rejected as stale.
+                Callers MUST pass this; None disables freshness checks
+                (only for backward-compat with codex path).
+
+        Two-pass strategy:
+        1. Check expected files (required_outputs) — only accept if fresh.
+        2. Fallback: glob the stage dir for NEW files only, filtered by:
+           a. mtime >= dispatch_start (reject stale pre-existing files)
+           b. stem matches a stage-required ArtifactType (reject wrong types)
+        """
         found = set()
         for expected in task.required_outputs:
-            if (self.project_dir / expected).exists():
+            p = self.project_dir / expected
+            if p.exists():
+                if dispatch_start is not None:
+                    try:
+                        if p.stat().st_mtime < dispatch_start:
+                            continue
+                    except OSError:
+                        continue
                 found.add(expected)
 
-        pid = task.metadata.get("project_id", "")
-        if pid:
-            art_dir = self.project_dir / "projects" / pid / "artifacts" / task.stage.value
-            if art_dir.exists():
-                for f in art_dir.glob("*.yaml"):
-                    if not f.name.startswith("review_"):
+        if not found:
+            pid = task.metadata.get("project_id", "")
+            if pid:
+                art_dir = self.project_dir / "projects" / pid / "artifacts" / task.stage.value
+                if art_dir.exists():
+                    # Only accept artifact types required for this stage
+                    stage_types = STAGE_REQUIRED_ARTIFACTS.get(task.stage, [])
+                    known_types = {at.value for at in stage_types} if stage_types else {at.value for at in ArtifactType}
+                    for f in art_dir.glob("*.yaml"):
+                        if f.name.startswith("review_"):
+                            continue
+                        if dispatch_start is not None:
+                            try:
+                                if f.stat().st_mtime < dispatch_start:
+                                    continue
+                            except OSError:
+                                continue
+                        # Reject files whose name doesn't match any ArtifactType
+                        stem = f.stem
+                        if not any(at in stem for at in known_types):
+                            continue
                         rel = f"projects/{pid}/artifacts/{task.stage.value}/{f.name}"
                         found.add(rel)
 

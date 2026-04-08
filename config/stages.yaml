@@ -3,7 +3,7 @@
 
 stages:
   problem_definition:
-    description: "Define the research problem, scope, and motivation"
+    description: "Researcher: 定义研究问题、范围与动机，引用5+已有方法与论文 | Critic: 评审问题定义的清晰度、创新性、可行性，结合已有研究方向分析"
     primary_agent: researcher
     reviewer: critic
     required_artifacts:
@@ -28,7 +28,7 @@ stages:
     human_gate: false
 
   literature_review:
-    description: "Comprehensive literature analysis and gap identification"
+    description: "Researcher: 阅读文献、总结关键要素与核心结论，识别研究缺口，推荐baseline | Critic: 验证论文真实性(URL)、覆盖度、时效性，结合已有研究方向专业分析"
     primary_agent: researcher
     reviewer: critic
     required_artifacts:
@@ -54,7 +54,7 @@ stages:
     human_gate: false
 
   hypothesis_formation:
-    description: "Formulate testable, falsifiable research hypothesis"
+    description: "Researcher: 基于文献形成可证伪假设，定义kill criteria与最小可行实验 | Critic: 审查假设的创新性、可测试性、量化指标合理性，给出专业分析意见"
     primary_agent: researcher
     reviewer: critic
     required_artifacts:
@@ -82,7 +82,7 @@ stages:
     human_gate: true  # Always get human sign-off before committing
 
   experiment_design:
-    description: "Complete executable experiment specification"
+    description: "Engineer: 设计完整实验方案，说明每个文件作用与其中函数作用，定义数据集/模型/训练/评估/消融 | Critic: 审查设计完整性、可复现性、baseline公平性"
     primary_agent: engineer
     reviewer: critic
     required_artifacts:
@@ -113,7 +113,7 @@ stages:
     human_gate: false
 
   implementation:
-    description: "Code implementation of the experiment"
+    description: "Engineer: 实现代码，说明每个文件作用与关键函数职责，Orchestrator落盘并跑pytest验证 | Critic: 基于真实测试结果审查代码正确性、可复现性"
     primary_agent: engineer
     reviewer: critic
     required_artifacts:
@@ -139,7 +139,7 @@ stages:
     human_gate: false
 
   experimentation:
-    description: "Execute experiments and collect results"
+    description: "Engineer: 执行实验并收集结果，Orchestrator独立运行并记录真实metrics | Critic: 基于Orchestrator验证的真实指标审查，检测异常与伪造"
     primary_agent: engineer
     reviewer: engineer  # Self-review for debugging
     required_artifacts:
@@ -165,7 +165,7 @@ stages:
     human_gate: true  # Human reviews before expensive compute
 
   analysis:
-    description: "Analyze results and draw conclusions"
+    description: "Researcher: 分析实验结果，每个claim必须引用具体实验与真实数据 | Critic: 审查证据支撑度、统计有效性、诚实报告，判断是否需要回退"
     primary_agent: researcher
     reviewer: critic
     required_artifacts:

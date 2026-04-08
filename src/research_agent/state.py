@@ -1,11 +1,13 @@
 """Project state persistence — file-based, JSON-serialized.
 
 Each project lives in its own directory under `projects/`.
-State is written atomically to avoid corruption.
+State is written atomically (tmp + rename) and protected against
+concurrent updates via file locking (fcntl.flock).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import shutil
 import uuid
@@ -46,10 +48,20 @@ class StateManager:
         return state
 
     def load_project(self, project_id: str) -> ProjectState:
+        """Load project state with shared lock to avoid reading during a write."""
         state_file = self.projects_dir / project_id / "state.json"
         if not state_file.exists():
             raise FileNotFoundError(f"Project not found: {project_id}")
-        data = json.loads(state_file.read_text(encoding="utf-8"))
+
+        lock_file = self._lock_path(project_id)
+        lock_file.touch(exist_ok=True)
+        with open(lock_file, "r") as lf:
+            fcntl.flock(lf, fcntl.LOCK_SH)
+            try:
+                data = json.loads(state_file.read_text(encoding="utf-8"))
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+
         return ProjectState.model_validate(data)
 
     def save_project(self, state: ProjectState) -> None:
@@ -107,16 +119,34 @@ class StateManager:
 
     # --- internal ---
 
+    def _lock_path(self, project_id: str) -> Path:
+        """Path for the per-project lock file."""
+        return self.projects_dir / project_id / "state.json.lock"
+
     def _save_state(self, state: ProjectState) -> None:
+        """Atomic write with exclusive file lock.
+
+        Sequence: acquire lock → write tmp → rename tmp → release lock.
+        The lock file is separate from state.json so that tmp+rename
+        atomicity is preserved (renaming the locked file itself would
+        release the lock on some systems).
+        """
         project_dir = self.projects_dir / state.project_id
         state_file = project_dir / "state.json"
         tmp_file = project_dir / "state.json.tmp"
-        # Atomic write
-        tmp_file.write_text(
-            state.model_dump_json(indent=2),
-            encoding="utf-8",
-        )
-        tmp_file.replace(state_file)
+        lock_file = self._lock_path(state.project_id)
+
+        lock_file.touch(exist_ok=True)
+        with open(lock_file, "r") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                tmp_file.write_text(
+                    state.model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+                tmp_file.replace(state_file)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _slugify(text: str) -> str:

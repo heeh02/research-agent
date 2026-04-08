@@ -184,6 +184,7 @@ class Artifact(BaseModel):
     created_by: AgentRole
     created_at: datetime = Field(default_factory=datetime.now)
     metadata: dict[str, Any] = {}
+    provenance: dict[str, Any] = {}  # backend, model, duration, exit_code
 
 
 class StageTransition(BaseModel):
@@ -234,6 +235,7 @@ class VersionEventType(str, Enum):
     HUMAN_APPROVE = "human_approve"   # Human approved gate
     HUMAN_REJECT = "human_reject"     # Human rejected with feedback
     HUMAN_FEEDBACK = "human_feedback" # Human provided guidance
+    ISOLATION_VIOLATION = "isolation_violation"  # Agent wrote outside allowed paths
 
 
 class VersionEvent(BaseModel):

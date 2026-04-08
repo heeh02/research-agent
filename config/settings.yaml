@@ -1,8 +1,216 @@
+_stages:
+  rollback_rules:
+  - description: Hypothesis requires more literature support
+    from: hypothesis_formation
+    to: literature_review
+    trigger: need_more_evidence
+  - description: Experiment reveals hypothesis is poorly formed
+    from: experiment_design
+    to: hypothesis_formation
+    trigger: hypothesis_needs_revision
+  - description: Implementation reveals spec is incomplete or wrong
+    from: implementation
+    to: experiment_design
+    trigger: design_flaw_found
+  - description: Experiment failure due to code bug
+    from: experimentation
+    to: implementation
+    trigger: code_bug_found
+  - description: Results inconclusive, need additional experiments
+    from: analysis
+    to: experimentation
+    trigger: need_more_experiments
+  - description: Results disprove the hypothesis, need to pivot
+    from: analysis
+    to: hypothesis_formation
+    trigger: hypothesis_falsified
+  stages:
+    analysis:
+      description: 'Researcher: 分析实验结果，每个claim必须引用具体实验与真实数据 | Critic: 审查证据支撑度、统计有效性、诚实报告，判断是否需要回退'
+      gate_criteria:
+      - description: Results support the claims
+        name: evidence_support
+        weight: 0.25
+      - description: Statistics are correct
+        name: statistical_validity
+        weight: 0.2
+      - description: Confounds addressed
+        name: alternative_explanations
+        weight: 0.2
+      - description: Negative results included
+        name: honest_reporting
+        weight: 0.15
+      - description: Results reproducible
+        name: reproducibility
+        weight: 0.2
+      human_gate: false
+      pass_threshold: 0.7
+      primary_agent: researcher
+      required_artifacts:
+      - result_report
+      - claim_checklist
+      reviewer: critic
+    experiment_design:
+      description: 'Engineer: 设计完整实验方案，说明每个文件作用与其中函数作用，定义数据集/模型/训练/评估/消融 | Critic: 审查设计完整性、可复现性、baseline公平性'
+      gate_criteria:
+      - description: All variables, controls, metrics defined
+        name: completeness
+        weight: 0.2
+      - description: Someone else could run this from the spec
+        name: reproducibility
+        weight: 0.15
+      - description: Appropriate tests, sample sizes, confidence levels
+        name: statistical_rigor
+        weight: 0.15
+      - description: Baselines given a fair chance
+        name: baseline_fairness
+        weight: 0.15
+      - description: Ablations isolate the claimed contribution
+        name: ablation_coverage
+        weight: 0.15
+      - description: Compute/data budget is realistic
+        name: budget_realism
+        weight: 0.1
+      - description: Clear plan for when things go wrong
+        name: failure_plan
+        weight: 0.1
+      human_gate: false
+      pass_threshold: 0.7
+      primary_agent: engineer
+      required_artifacts:
+      - experiment_spec
+      reviewer: critic
+    experimentation:
+      description: 'Engineer: 执行实验并收集结果，Orchestrator独立运行并记录真实metrics | Critic: 基于Orchestrator验证的真实指标审查，检测异常与伪造'
+      gate_criteria:
+      - description: All planned experiments ran
+        name: execution_complete
+        weight: 0.3
+      - description: All metrics tracked and saved
+        name: metrics_logged
+        weight: 0.2
+      - description: Results reproducible across seeds
+        name: reproducibility_check
+        weight: 0.2
+      - description: No unexplained anomalies in results
+        name: no_anomalies
+        weight: 0.15
+      - description: Compute usage logged
+        name: resource_tracking
+        weight: 0.15
+      human_gate: true
+      pass_threshold: 0.7
+      primary_agent: engineer
+      required_artifacts:
+      - run_manifest
+      - metrics
+      reviewer: engineer
+    hypothesis_formation:
+      description: 'Researcher: 基于文献形成可证伪假设，定义kill criteria与最小可行实验 | Critic: 审查假设的创新性、可测试性、量化指标合理性，给出专业分析意见'
+      gate_criteria:
+      - description: Can be disproven by experiment
+        name: falsifiability
+        weight: 0.2
+      - description: Not a minor variation of existing work
+        name: novelty
+        weight: 0.15
+      - description: Well-supported by literature
+        name: grounding
+        weight: 0.15
+      - description: Minimum viable experiment can test this
+        name: testability
+        weight: 0.2
+      - description: Key risks identified and mitigated
+        name: risk_awareness
+        weight: 0.15
+      - description: Specific enough to act on
+        name: kill_criteria
+        weight: 0.15
+      human_gate: true
+      pass_threshold: 0.7
+      primary_agent: researcher
+      required_artifacts:
+      - hypothesis_card
+      reviewer: critic
+    implementation:
+      description: 'Engineer: 实现代码，说明每个文件作用与关键函数职责，Orchestrator落盘并跑pytest验证 | Critic: 基于真实测试结果审查代码正确性、可复现性'
+      gate_criteria:
+      - description: Code implements the spec
+        name: correctness
+        weight: 0.3
+      - description: Seeds, versions, configs fixed
+        name: reproducibility
+        weight: 0.2
+      - description: Tests for critical paths
+        name: test_coverage
+        weight: 0.2
+      - description: No obvious performance issues
+        name: efficiency
+        weight: 0.15
+      - description: Can understand and run this
+        name: documentation
+        weight: 0.15
+      human_gate: false
+      pass_threshold: 0.7
+      primary_agent: engineer
+      required_artifacts:
+      - code
+      - test_result
+      reviewer: critic
+    literature_review:
+      description: 'Researcher: 阅读文献、总结关键要素与核心结论，识别研究缺口，推荐baseline | Critic: 验证论文真实性(URL)、覆盖度、时效性，结合已有研究方向专业分析'
+      gate_criteria:
+      - description: Key papers included, no major omissions
+        name: coverage
+        weight: 0.2
+      - description: Includes papers from last 2 years
+        name: recency
+        weight: 0.15
+      - description: Conflicting viewpoints represented
+        name: balance
+        weight: 0.15
+      - description: Claimed gaps are real and well-supported
+        name: gap_identification
+        weight: 0.3
+      - description: Appropriate baselines recommended
+        name: baseline_completeness
+        weight: 0.2
+      human_gate: false
+      pass_threshold: 0.7
+      primary_agent: researcher
+      required_artifacts:
+      - literature_map
+      - evidence_table
+      reviewer: critic
+    problem_definition:
+      description: 'Researcher: 定义研究问题、范围与动机，引用5+已有方法与论文 | Critic: 评审问题定义的清晰度、创新性、可行性，结合已有研究方向分析'
+      gate_criteria:
+      - description: Problem statement is unambiguous
+        name: clarity
+        weight: 0.2
+      - description: Addresses a real and important gap
+        name: significance
+        weight: 0.2
+      - description: Neither too broad nor too narrow
+        name: scope
+        weight: 0.2
+      - description: Genuinely different from existing work
+        name: novelty
+        weight: 0.2
+      - description: Can be investigated with available resources
+        name: feasibility
+        weight: 0.2
+      human_gate: false
+      pass_threshold: 0.7
+      primary_agent: researcher
+      required_artifacts:
+      - problem_brief
+      reviewer: critic
 agents:
   critic:
-    backend: opencode
-    effort: high
-    model: volcengine-plan/doubao-seed-2.0-code
+    backend: codex
+    effort: xhigh
+    model: gpt-5.4
   engineer:
     allowed_tools: Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent
     backend: opencode
@@ -17,10 +225,10 @@ agents:
     model: volcengine-plan/doubao-seed-2.0-pro
   researcher:
     allowed_tools: Read,Write,Glob,Grep,WebSearch,WebFetch,Agent
-    backend: opencode
-    effort: high
+    backend: claude
+    effort: max
     max_turns: 30
-    model: volcengine-plan/doubao-seed-2.0-pro
+    model: claude-opus-4-20250514
 cost:
   codex_estimated_cost_per_review: 0.1
   hard_limit: 50.0

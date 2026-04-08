@@ -1,8 +1,3 @@
-from .base import BaseAgent
-from .researcher import ResearcherAgent
-from .engineer import EngineerAgent
+from .critic import CriticAgent, STAGE_REVIEW_CRITERIA
 
-# CriticAgent is separate — it uses Codex CLI, not BaseAgent's LLM API.
-# Import it directly: from research_agent.agents.critic import CriticAgent
-
-__all__ = ["BaseAgent", "ResearcherAgent", "EngineerAgent"]
+__all__ = ["CriticAgent", "STAGE_REVIEW_CRITERIA"]

@@ -1,0 +1,12 @@
+# Schema for run_manifest artifact
+required_fields:
+  - entry_point
+  - smoke_test_command
+
+field_types:
+  entry_point: string
+  smoke_test_command: string
+  args: list
+  environment_setup: list
+  expected_outputs: list
+  estimated_runtime: string

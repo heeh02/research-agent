@@ -13,6 +13,9 @@ Launch: python scripts/multi_agent.py gui [--port 8080]
 from __future__ import annotations
 
 import json
+import os
+import re
+import subprocess
 import threading
 import uuid
 from datetime import datetime
@@ -21,12 +24,23 @@ from typing import Any, Optional
 
 import yaml
 
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
 from .models import (
     ALLOWED_TRANSITIONS, STAGE_ORDER, STAGE_PRIMARY_AGENT, STAGE_REQUIRED_ARTIFACTS,
-    AgentRole, ArtifactType, CLIBackend, GateCheck, GateResult, GateStatus,
-    ProjectState, Stage, VersionEventType,
+    AgentRole, ArtifactType, CLIBackend, CostRecord, GateCheck, GateResult, GateStatus,
+    LLMProvider, ProjectState, Stage, VersionEventType,
 )
 from .state import StateManager
+from .verdict import (
+    evaluate_rollback,
+    parse_failure_type, FAILURE_TYPE_CROSS_STAGE,
+)
+from .gate_eval import evaluate_gate_verdict
+from .prechecks import pre_review_checks as shared_pre_review_checks
+from .execution import materialize_code as shared_materialize_code
+from .execution import execute_experiment as shared_execute_experiment
+from .execution import run_and_record_tests, run_and_record_experiment
 from .artifacts import create_artifact
 from .dispatcher import MultiAgentDispatcher, TaskCard, AgentResult
 
@@ -48,7 +62,8 @@ _STAGE_YAML_FORMATS = {
     Stage.LITERATURE_REVIEW: (
         "Output format (YAML in ```yaml fences):\n"
         "  research_question, search_scope,\n"
-        "  papers: [{title, authors, year, venue, method, key_results, limitations, relevance_score}] (10+),\n"
+        "  papers: [{title, authors, year, venue, method, key_results, limitations, relevance_score, url}] (10+),\n"
+        "  CRITICAL: every paper MUST have a `url` field with the real URL where you found it.\n"
         "  method_taxonomy: {category: [methods]},\n"
         "  identified_gaps: [] (3+), conflicting_findings, trend_analysis,\n"
         "  recommended_baselines: [] (3+)"
@@ -121,14 +136,14 @@ class PipelineRunner:
 
     def log(self, msg: str):
         self.log_lines.append({"t": datetime.now().strftime("%H:%M:%S"), "m": msg})
-        if len(self.log_lines) > 500:
-            self.log_lines = self.log_lines[-500:]
+        if len(self.log_lines) > 2000:
+            self.log_lines = self.log_lines[-2000:]
 
     def get_status(self) -> dict:
         return {
             "running": self.running, "mode": self.mode,
             "stage": self.stage_label, "waiting_approval": self.waiting_approval,
-            "log": self.log_lines[-100:],
+            "log": self.log_lines[-500:],
         }
 
     # --- Public actions ---
@@ -155,13 +170,42 @@ class PipelineRunner:
             return
         self._start_thread("review", self._do_review)
 
-    def approve(self):
+    def approve(self, feedback: str = ""):
         if self.waiting_approval:
+            self._approval_feedback = feedback
             self._approval.set()
+
+    def reject(self, feedback: str = ""):
+        """Reject at human gate — record event and keep pipeline paused."""
+        if not self.waiting_approval:
+            return
+        pid = self.project_id
+        if pid:
+            state = self.sm.load_project(pid)
+            state.record_event(VersionEventType.HUMAN_REJECT,
+                               f"Human rejected: {feedback[:80]}" if feedback else "Human rejected",
+                               detail=feedback)
+            self.sm.save_project(state)
+        self.log(f"Rejected: {feedback[:100]}" if feedback else "Rejected by user.")
+        self.waiting_approval = False
+        self._stop.set()
+        self._approval.set()
 
     def stop(self):
         self._stop.set()
         self._approval.set()  # unblock if waiting
+        # Force-kill running dispatcher subprocess if any
+        d = self._dispatcher
+        if d and hasattr(d, '_active_proc') and d._active_proc is not None:
+            try:
+                import signal
+                os.killpg(os.getpgid(d._active_proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    d._active_proc.kill()
+                except Exception:
+                    pass
+            self.log("  Force-killed running agent process.")
 
     def _start_thread(self, mode, target, *args):
         self.running = True
@@ -266,26 +310,140 @@ class PipelineRunner:
         self.log(f"┌─ {icon} Done ({result.duration_seconds:.1f}s){retry}")
         self.log(f"└─ Files: {result.output_files}")
 
+        # --- Validate and register artifacts BEFORE recording the event ---
         state = self.sm.load_project(pid)
-        # Build descriptive summary for GUI timeline
-        backend = d.backends.get(role, CLIBackend.CLAUDE)
-        file_names = [Path(p).name for p in result.output_files]
-        summary = f"{role.value} ({backend.value}) → {', '.join(file_names) or 'no files'}"
+        project_dir = self.base_dir / "projects" / pid
+        registered_count = 0
+        registered_types: set[ArtifactType] = set()
+        accepted_files: list[str] = []
 
-        state.record_event(
-            VersionEventType.AGENT_RUN,
-            summary,
-            agent=role, artifacts_produced=result.output_files,
-            cost_usd=result.cost_usd, duration_seconds=result.duration_seconds,
-            detail=result.output_text,
-        )
+        from .artifacts import load_schema, validate_artifact_content, register_artifact_file
         for p in result.output_files:
             for at in ArtifactType:
                 if at.value in Path(p).stem:
-                    create_artifact(state, at, stage, role, Path(p).name)
+                    op = Path(p)
+                    if op.is_absolute():
+                        actual = op
+                    elif str(op).startswith("projects/"):
+                        actual = self.base_dir / op
+                    else:
+                        actual = project_dir / op
+
+                    if not actual.exists():
+                        self.log(f"  SKIP: {at.value} — file not found: {actual}")
+                        break
+
+                    try:
+                        raw = actual.read_text(encoding="utf-8")
+                        yaml.safe_load(raw)
+                    except yaml.YAMLError as e:
+                        self.log(f"  REJECT: {at.value} — invalid YAML: {e}")
+                        break
+
+                    schema = load_schema(self.base_dir / "schemas", at)
+                    if schema:
+                        errors = validate_artifact_content(raw, schema)
+                        if errors:
+                            self.log(f"  REJECT: {at.value} — schema errors: {errors[:3]}")
+                            break
+
+                    art = register_artifact_file(
+                        state, at, stage, role, actual, project_dir,
+                        metadata={
+                            "backend": d.backends.get(role, CLIBackend.CLAUDE).value,
+                            "model": d.models.get(role, "unknown"),
+                            "duration_seconds": result.duration_seconds,
+                            "exit_code": result.exit_code,
+                            "iteration": state.current_iteration(),
+                        },
+                    )
+                    registered_count += 1
+                    registered_types.add(at)
+                    # Use canonical path (register may have renamed the file)
+                    accepted_files.append(f"projects/{pid}/{art.path}")
                     break
+
+        # --- Post-validation: update result to reflect what was actually registered ---
+
+        if result.output_files and registered_count == 0:
+            result.success = False
+            result.output_files = []
+            result.error = "All output files rejected by validation"
+            self.log(f"  All output file(s) rejected — step marked failed")
+        else:
+            result.output_files = accepted_files
+
+        # Check THIS dispatch's completeness (not historical artifacts)
+        required_types_list = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+        if required_types_list and registered_count > 0:
+            missing = [at.value for at in required_types_list if at not in registered_types]
+            if missing:
+                result.success = False
+                result.error = f"Missing required artifacts: {missing}"
+                self.log(f"  Incomplete: missing {missing} — proceeding to review for feedback")
+
+        # --- NOW record event with accurate post-validation data ---
+        backend = d.backends.get(role, CLIBackend.CLAUDE)
+        summary = f"{role.value} ({backend.value}) → {', '.join(Path(p).name for p in accepted_files) or 'no valid artifacts'}"
+        state.record_event(
+            VersionEventType.AGENT_RUN,
+            summary,
+            agent=role, artifacts_produced=accepted_files,
+            cost_usd=result.cost_usd, duration_seconds=result.duration_seconds,
+            detail=result.output_text,
+        )
+        # Record cost
+        if result.cost_usd > 0:
+            backend_enum = d.backends.get(role, CLIBackend.CLAUDE)
+            _pmap = {CLIBackend.CLAUDE: LLMProvider.CLAUDE, CLIBackend.CODEX: LLMProvider.CODEX,
+                     CLIBackend.OPENCODE: LLMProvider.OPENCODE}
+            cost_desc = f"{role.value}/{stage.value}"
+            if result.cost_source == "estimated":
+                cost_desc += " (estimated)"
+            state.cost_records.append(CostRecord(
+                agent=role, provider=_pmap.get(backend_enum, LLMProvider.CLAUDE),
+                model=d.models.get(role, "unknown"),
+                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                cost_usd=result.cost_usd, task_description=cost_desc, stage=stage,
+            ))
+
         self.sm.save_project(state)
         return result
+
+    def _materialize_code(self, state) -> list[str]:
+        """Extract code from YAML code artifacts into actual files."""
+        return shared_materialize_code(
+            state, self.sm, self.project_id, self.base_dir, log_fn=self.log,
+        )
+
+    def _execute_experiment(self, state) -> tuple[Optional[str], int]:
+        """Run the smoke test from run_manifest and capture output."""
+        return shared_execute_experiment(
+            state, self.sm, self.project_id, self.base_dir, log_fn=self.log,
+        )
+
+    def _pre_review_checks(self, state, stage) -> list[str]:
+        """Automated structural checks — delegates to shared prechecks module."""
+        return shared_pre_review_checks(
+            state, stage, self.sm, self.project_id, self.base_dir,
+        )
+
+    def _run_orchestrator_validation(self, stage: Stage) -> dict:
+        """Orchestrator step: validate, materialize, execute BEFORE critic review."""
+        pid = self.project_id
+        state = self.sm.load_project(pid)
+
+        if stage == Stage.IMPLEMENTATION:
+            self.log("  [Orchestrator] Materializing code and running tests...")
+            return run_and_record_tests(
+                state, self.sm, pid, self.base_dir, log_fn=self.log)
+
+        if stage == Stage.EXPERIMENTATION:
+            self.log("  [Orchestrator] Executing experiment and recording metrics...")
+            return run_and_record_experiment(
+                state, self.sm, pid, self.base_dir, log_fn=self.log)
+
+        return {"success": True}
 
     def _do_review(self) -> Optional[GateResult]:
         pid = self.project_id
@@ -294,18 +452,60 @@ class PipelineRunner:
         d = self._get_dispatcher()
         self.stage_label = stage.value
 
+        # Run automated structural pre-checks
+        pre_issues = self._pre_review_checks(state, stage)
+        if pre_issues:
+            self.log(f"  Pre-check issues found:")
+            for iss in pre_issues:
+                self.log(f"    - {iss}")
+
         # Build a proper review instruction with criteria and verdict format
         from .agents.critic import STAGE_REVIEW_CRITERIA
         criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
 
-        # Read latest artifacts to include in review prompt
+        # Read ONLY the latest version of each artifact type for review
         art_summaries = []
-        for a in state.stage_artifacts(stage):
+        seen_types: set[str] = set()
+        for a in reversed(state.stage_artifacts(stage)):
+            if a.artifact_type.value in seen_types:
+                continue  # Skip older versions — critic should only see latest
+            seen_types.add(a.artifact_type.value)
             try:
                 content = self.sm.read_artifact_file(pid, a)
-                art_summaries.append(f"### {a.artifact_type.value} (v{a.version})\n```yaml\n{content[:3000]}\n```")
+                art_summaries.append(f"### {a.artifact_type.value} (v{a.version} — latest)\n```yaml\n{content[:3000]}\n```")
             except Exception:
                 pass
+        art_summaries.reverse()  # Restore chronological order for readability
+
+        # Include pre-check issues in the review prompt so critic is aware
+        pre_check_section = ""
+        if pre_issues:
+            pre_check_section = (
+                "\n\n## Automated Pre-Check Issues (MUST address in review)\n"
+                + "\n".join(f"- BLOCKING: {iss}" for iss in pre_issues)
+                + "\nThese issues were detected by automated checks. If they are valid, your verdict MUST NOT be PASS.\n"
+            )
+
+        # Build stage-specific score keys from stages.yaml if available
+        score_keys = "rigor, completeness, clarity, novelty"  # default
+        stages_cfg_file = self.base_dir / "config" / "stages.yaml"
+        stages_cfg = {}
+        if stages_cfg_file.exists():
+            try:
+                stages_cfg = yaml.safe_load(stages_cfg_file.read_text()) or {}
+                stage_criteria = stages_cfg.get("stages", {}).get(stage.value, {}).get("gate_criteria", [])
+                if stage_criteria:
+                    score_keys = ", ".join(c["name"] for c in stage_criteria if "name" in c)
+            except Exception:
+                pass
+
+        orchestrator_note = ""
+        if stage in (Stage.IMPLEMENTATION, Stage.EXPERIMENTATION):
+            orchestrator_note = (
+                "\n\n## Orchestrator Execution Results\n"
+                "The test_result and metrics artifacts have been VERIFIED by the Orchestrator "
+                "through actual code execution. Review the ACTUAL results, not agent claims.\n"
+            )
 
         review_instruction = (
             f"CRITICAL RULES:\n"
@@ -314,20 +514,22 @@ class PipelineRunner:
             f"Review the {stage.value} artifacts below.\n\n"
             f"## Review Criteria\n{criteria}\n\n"
             f"## Artifacts to Review\n" + "\n\n".join(art_summaries) + "\n\n"
-            f"## Required Output (print this YAML, do NOT write any files)\n"
+            + orchestrator_note
+            + f"## Required Output (print this YAML, do NOT write any files)\n"
             f"```yaml\n"
             f"verdict: PASS | REVISE | FAIL\n"
-            f"scores:\n"
-            f"  rigor: 0.0-1.0\n"
-            f"  completeness: 0.0-1.0\n"
-            f"  clarity: 0.0-1.0\n"
-            f"  novelty: 0.0-1.0\n"
-            f"blocking_issues: []\n"
+            f"failure_type: (required if REVISE/FAIL) structural_issue | implementation_bug | "
+            f"design_flaw | hypothesis_needs_revision | evidence_insufficient | "
+            f"hypothesis_falsified | analysis_gap\n"
+            f"scores:  # score each 0.0-1.0\n"
+            + "".join(f"  {k.strip()}: 0.0-1.0\n" for k in score_keys.split(","))
+            + f"blocking_issues: []\n"
             f"suggestions: []\n"
             f"strongest_objection: \"\"\n"
             f"what_would_make_it_pass: \"\"\n"
             f"```\n"
             f"PASS only if ALL scores >= 0.7 AND no blocking issues.\n"
+            + pre_check_section
         )
 
         task = self._build_task(state, stage, AgentRole.CRITIC, review_instruction)
@@ -355,14 +557,22 @@ class PipelineRunner:
             self.sm.save_project(state)
             return gr
 
-        upper = result.output_text.upper()
-        verdict = "REVISE"
-        if result.success:
-            verdict = "PASS"
-        elif "VERDICT: PASS" in upper or "VERDICT:PASS" in upper:
-            verdict = "PASS"
-        elif any(v in upper for v in ["VERDICT: FAIL", "VERDICT:FAIL", "VERDICT: REJECT"]):
-            verdict = "FAIL"
+        # --- Layered gate evaluation (shared module) ---
+        stage_gate = stages_cfg.get("stages", {}).get(stage.value, {}) if stages_cfg else {}
+        stage_criteria = stage_gate.get("gate_criteria", [])
+        threshold = stage_gate.get("pass_threshold", 0.7)
+
+        gv = evaluate_gate_verdict(
+            result.output_text, result.success,
+            pre_issues, stage_criteria, threshold,
+        )
+        verdict = gv.verdict
+
+        if gv.pre_check_override:
+            self.log(f"  Pre-check override: PASS → REVISE ({len(pre_issues)} blocking issue(s))")
+            result.output_text += gv.annotation
+        if gv.score_override:
+            self.log(f"  Weighted score {gv.weighted_avg:.2f} < {threshold} — PASS → REVISE")
 
         gr = GateResult(
             gate_name=f"{stage.value}_review", stage=stage,
@@ -381,6 +591,20 @@ class PipelineRunner:
         state.record_event(evt, f"Critic: {verdict}", agent=AgentRole.CRITIC,
                            gate_verdict=verdict, duration_seconds=result.duration_seconds,
                            detail=result.output_text)
+        # Record review cost
+        if result.cost_usd > 0:
+            backend_enum = d.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
+            _pmap = {CLIBackend.CLAUDE: LLMProvider.CLAUDE, CLIBackend.CODEX: LLMProvider.CODEX,
+                     CLIBackend.OPENCODE: LLMProvider.OPENCODE}
+            cost_desc = f"critic/{stage.value}"
+            if result.cost_source == "estimated":
+                cost_desc += " (estimated)"
+            state.cost_records.append(CostRecord(
+                agent=AgentRole.CRITIC, provider=_pmap.get(backend_enum, LLMProvider.CLAUDE),
+                model=d.models.get(AgentRole.CRITIC, "unknown"),
+                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                cost_usd=result.cost_usd, task_description=cost_desc, stage=stage,
+            ))
         self.sm.save_project(state)
 
         icon = "✓" if verdict == "PASS" else "✗"
@@ -393,6 +617,12 @@ class PipelineRunner:
         if not result.success and not result.output_files:
             self.log("Agent produced no output.")
             return
+
+        # Orchestrator validates + executes (BEFORE critic review)
+        state = self.sm.load_project(self.project_id)
+        stage = state.current_stage
+        self._run_orchestrator_validation(stage)
+
         self._do_review()
 
     def _run_auto(self, until_stage, max_rev, instruction):
@@ -424,8 +654,9 @@ class PipelineRunner:
                     self.log("Stopped by user.")
                     return
 
+                # 1. Agent produces artifacts
                 result = self._do_step(instruction)
-                instruction = ""  # only first iteration uses custom instruction
+                instruction = ""
 
                 if result.is_auth_error:
                     self.log("Auth error — pipeline paused.")
@@ -435,10 +666,20 @@ class PipelineRunner:
                     self.log("No output, retrying...")
                     continue
 
+                # 2. Orchestrator validates + executes (BEFORE critic review)
+                self._run_orchestrator_validation(stage)
+
+                # 3. Critic reviews ACTUAL results
                 gr = self._do_review()
                 if gr and gr.status == GateStatus.PASSED:
                     break
 
+                # 4. Check failure_type for cross-stage rollback
+                ft = parse_failure_type(gr.overall_feedback if gr else "")
+                if ft and ft in FAILURE_TYPE_CROSS_STAGE:
+                    break  # Exit inner loop — outer loop handles rollback
+
+                # Same-stage revise
                 if rev < max_rev:
                     state = self.sm.load_project(pid)
                     state.increment_iteration()
@@ -451,6 +692,23 @@ class PipelineRunner:
             latest = gates[-1] if gates else None
 
             if not latest or latest.status != GateStatus.PASSED:
+                # --- Automatic backward transition evaluation ---
+                max_iters = self.config.get("pipeline", {}).get("max_iterations", 5)
+                rollback_target = evaluate_rollback(
+                    state, stage, latest, max_iters,
+                    state_manager=self.sm, project_id=pid,
+                )
+                if rollback_target:
+                    trigger = ALLOWED_TRANSITIONS.get(
+                        (stage, rollback_target), "auto_rollback"
+                    )
+                    state.record_transition(
+                        rollback_target, trigger, gate_result=latest,
+                        notes=f"Auto-rollback from {stage.value}",
+                    )
+                    self.sm.save_project(state)
+                    self.log(f"  ↩ Auto-rollback: {stage.value} → {rollback_target.value}")
+                    continue  # Re-enter while loop at rolled-back stage
                 self.log(f"Gate not passed for {stage.value}. Paused.")
                 break
 
@@ -474,10 +732,29 @@ class PipelineRunner:
                     self.log("Stopped by user.")
                     return
 
-                self.log("Approved! Advancing...")
+                fb = getattr(self, '_approval_feedback', '') or ''
+                self._approval_feedback = ''
+                self.log(f"Approved!{' Feedback: ' + fb[:80] if fb else ''} Advancing...")
                 state = self.sm.load_project(pid)
-                state.record_event(VersionEventType.HUMAN_APPROVE, "Human approved")
+                state.record_event(VersionEventType.HUMAN_APPROVE,
+                                   f"Human approved{': ' + fb[:80] if fb else ''}",
+                                   detail=fb)
                 self.sm.save_project(state)
+
+            # Pre-advance completeness gate: iteration-aware
+            state = self.sm.load_project(pid)
+            cur_iter = state.current_iteration()
+            required = STAGE_REQUIRED_ARTIFACTS.get(stage, [])
+            advance_missing = []
+            for at in required:
+                lat = state.latest_artifact(at)
+                if not lat:
+                    advance_missing.append(at.value)
+                elif lat.metadata.get("iteration", 0) < cur_iter:
+                    advance_missing.append(f"{at.value} (stale)")
+            if advance_missing:
+                self.log(f"  Cannot advance: missing/stale artifacts {advance_missing}")
+                break
 
             # Advance
             idx = STAGE_ORDER.index(stage)
@@ -563,6 +840,23 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .btn:hover:not(:disabled){border-color:var(--bl);color:var(--tx)}
 .btn.active{background:var(--bl);color:var(--bg);border-color:var(--bl)}
 
+/* Overview panel */
+.overview{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:14px 16px;margin:6px 0}
+.ov-q{font-size:13px;color:var(--cy);line-height:1.6;margin-bottom:10px;border-left:3px solid var(--cy);padding-left:10px}
+.ov-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+.ov-card{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:8px 10px}
+.ov-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
+.ov-val{font-size:18px;font-weight:600;color:var(--br);margin-top:2px}
+.ov-val.sm{font-size:13px}
+.ov-stage-desc{font-size:11px;color:var(--dim);margin-top:8px;padding:6px 10px;background:var(--bg);border-radius:4px;border-left:2px solid var(--bl)}
+
+/* Stats panel */
+.stat-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:11px}
+.stat-lbl{width:120px;color:var(--dim);text-align:right;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stat-bar{flex:1;height:16px;background:var(--bg);border-radius:3px;overflow:hidden;position:relative}
+.stat-fill{height:100%;border-radius:3px;transition:width .3s}
+.stat-val{width:60px;font-size:10px;color:var(--dim);text-align:right;flex-shrink:0}
+
 /* Control bar */
 .ctrl{display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--bd);border-bottom:1px solid var(--bd);flex-wrap:wrap}
 .ctrl label{color:var(--dim);font-size:11px}
@@ -595,6 +889,7 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .schip.active{background:#1a1f35;border-color:var(--bl);color:var(--bl);box-shadow:0 0 6px rgba(88,166,255,.2)}
 .schip.failed{background:#2d1215;border-color:var(--rd);color:var(--rd)}
 .schip .al{display:block;font-size:8px;color:var(--dim);margin-top:1px}
+.schip .iter{font-size:9px;background:var(--yl);color:var(--bg);padding:0 4px;border-radius:3px;font-weight:700;margin-left:2px}
 
 /* Timeline + Detail */
 .main{display:grid;grid-template-columns:220px 1fr;gap:10px;flex:1;min-height:0;overflow:hidden;padding-top:6px}
@@ -628,12 +923,12 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .al-list{list-style:none;margin-top:4px}
 .al-list li{font-size:10px;padding:1px 0;color:var(--cy)}
 .al-list li::before{content:"\1F4C4 "}
-.dtxt{font-size:11px;white-space:pre-wrap;word-break:break-word;color:var(--tx);background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--bd);margin-top:6px;max-height:150px;overflow-y:auto;cursor:pointer;transition:max-height .3s;font-family:'SF Mono',Consolas,monospace;font-size:11px}
+.dtxt{font-size:11px;white-space:pre-wrap;word-break:break-word;color:var(--tx);background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--bd);margin-top:6px;max-height:300px;overflow-y:auto;transition:max-height .3s;font-family:'SF Mono',Consolas,monospace}
 .dtxt.exp{max-height:none}
 .dtog{font-size:10px;color:var(--bl);cursor:pointer;margin-top:2px;user-select:none}
 
 /* Console */
-.console{background:#000;border:1px solid var(--bd);border-radius:6px;height:150px;display:flex;flex-direction:column;margin-top:6px;flex-shrink:0}
+.console{background:#000;border:1px solid var(--bd);border-radius:6px;height:200px;min-height:80px;max-height:60vh;resize:vertical;display:flex;flex-direction:column;margin-top:6px;overflow:hidden}
 .console-hdr{display:flex;justify-content:space-between;align-items:center;padding:4px 10px;border-bottom:1px solid var(--bd);flex-shrink:0}
 .console-hdr span{font-size:11px;color:var(--dim)}
 .con-body{flex:1;overflow-y:auto;padding:6px 10px;font-family:'SF Mono',Consolas,monospace;font-size:11px;color:var(--gr);line-height:1.4}
@@ -646,6 +941,14 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .modal h3{font-size:15px;color:var(--br);margin-bottom:14px}
 .modal input{width:100%;margin-bottom:10px;padding:10px;font-size:13px;border-radius:6px}
 .modal .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+
+/* Full-screen viewer modal */
+.viewer{background:var(--sf);border:1px solid var(--bd);border-radius:10px;width:90vw;height:85vh;display:flex;flex-direction:column}
+.viewer-hdr{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid var(--bd);flex-shrink:0}
+.viewer-hdr h3{font-size:14px;color:var(--br);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.viewer-body{flex:1;overflow:auto;padding:14px 16px;font-family:'SF Mono',Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;color:var(--tx);margin:0;line-height:1.5}
+.btn-view{background:none;border:1px solid var(--bd);color:var(--bl);padding:1px 6px;border-radius:3px;font-size:10px;cursor:pointer;margin-left:4px}
+.btn-view:hover{border-color:var(--bl);background:rgba(88,166,255,.1)}
 
 @media(max-width:900px){.sidebar{width:200px}.main{grid-template-columns:1fr}.stages{flex-wrap:wrap}}
 @media(max-width:640px){.sidebar{display:none}.content{padding:0 10px 8px}}
@@ -668,15 +971,25 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
       <h1 id="projName"></h1>
       <span class="badge badge-cost" id="costLabel"></span>
       <span class="badge badge-v" id="verLabel"></span>
+      <button class="btn" id="statsBtn" onclick="togglePanel('statsPanel',this)">Stats</button>
       <button class="btn" id="setBtn" onclick="togglePanel('setPanel',this)">Settings</button>
+    </div>
+
+    <!-- Overview panel -->
+    <div class="overview" id="overviewPanel">
+      <div class="ov-q" id="ovQuestion"></div>
+      <div class="ov-grid" id="ovGrid"></div>
+      <div class="ov-stage-desc" id="ovStageDesc"></div>
     </div>
 
     <!-- Control bar -->
     <div class="ctrl">
-      <button class="btn-run" id="btnAuto" onclick="doAuto()">Auto</button>
-      <button class="btn" id="btnStep" onclick="doStep()">Step</button>
-      <button class="btn" id="btnReview" onclick="doReview()">Review</button>
+      <button class="btn-run" id="btnAuto" onclick="doAuto(this)">Auto</button>
+      <button class="btn" id="btnStep" onclick="doStep(this)">Step</button>
+      <button class="btn" id="btnReview" onclick="doReview(this)">Review</button>
       <button class="btn-approve" id="btnApprove" onclick="doApprove()" style="display:none">Approve</button>
+      <input id="gateFeedback" style="display:none;min-width:120px;flex:1" placeholder="Feedback (optional)">
+      <button class="btn-stop" id="btnReject" onclick="doReject()" style="display:none">Reject</button>
       <button class="btn-stop" id="btnStop" onclick="doStop()" style="display:none">Stop</button>
       <span style="margin:0 4px;color:var(--bd)">|</span>
       <label>Until</label>
@@ -701,6 +1014,12 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
       </div>
     </div>
 
+    <!-- Stats panel -->
+    <div class="panel" id="statsPanel">
+      <h3>Cost &amp; Duration Analytics</h3>
+      <div id="statsContent"></div>
+    </div>
+
     <!-- Stages -->
     <div class="stages" id="stagesBar"></div>
 
@@ -708,6 +1027,11 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
     <div class="main">
       <div class="side">
         <h3>Timeline (<span id="evCnt">0</span>)</h3>
+        <div style="padding:4px 8px;border-bottom:1px solid var(--bd)">
+          <select id="tlFilterStage" onchange="renderTimeline()" style="width:100%;font-size:10px;padding:2px 4px">
+            <option value="">All stages</option>
+          </select>
+        </div>
         <div class="side-scroll" id="timeline"></div>
       </div>
       <div class="det">
@@ -723,7 +1047,11 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
     <div class="console">
       <div class="console-hdr">
         <span>Console</span>
-        <button class="btn" style="padding:1px 6px;font-size:10px" onclick="document.getElementById('conBody').innerHTML=''">Clear</button>
+        <div style="display:flex;gap:4px;align-items:center">
+          <input id="conSearch" oninput="conSearch(this.value)" placeholder="Search..." style="width:120px;padding:1px 6px;font-size:10px;border-radius:3px">
+          <button class="btn" style="padding:1px 6px;font-size:10px" onclick="openViewer('Full Console Log',document.getElementById('conBody').innerText)">Full Log</button>
+          <button class="btn" style="padding:1px 6px;font-size:10px" onclick="document.getElementById('conBody').innerHTML='';document.getElementById('conSearch').value=''">Clear</button>
+        </div>
       </div>
       <div class="con-body" id="conBody"></div>
     </div>
@@ -740,6 +1068,20 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
       <button class="btn" onclick="hideModal()">Cancel</button>
       <button class="btn-run" onclick="createProject()">Create</button>
     </div>
+  </div>
+</div>
+
+<!-- Full-screen viewer modal -->
+<div class="modal-bg" id="viewerBg" onclick="if(event.target===this)closeViewer()">
+  <div class="viewer">
+    <div class="viewer-hdr">
+      <h3 id="viewerTitle">Output</h3>
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        <button class="btn" onclick="copyViewer()">Copy</button>
+        <button class="btn" onclick="closeViewer()">Close</button>
+      </div>
+    </div>
+    <pre class="viewer-body" id="viewerBody"></pre>
   </div>
 </div>
 
@@ -761,7 +1103,7 @@ function init(){
   const us=document.getElementById('untilStage');
   STAGE_NAMES.forEach(s=>us.innerHTML+=`<option value="${s}">${s.replace(/_/g,' ')}</option>`);
   document.getElementById('evCnt').textContent=DATA.timeline.length;
-  renderSidebar();renderStages();renderTimeline();buildSettings();updateUI();
+  renderSidebar();renderOverview();renderStages();renderTimeline();renderStats();buildSettings();updateUI();
 }
 
 // ============ SIDEBAR — project list ============
@@ -784,31 +1126,77 @@ function renderSidebar(){
   });
 }
 
+// ============ OVERVIEW ============
+function renderOverview(){
+  const q=DATA.research_question;
+  document.getElementById('ovQuestion').textContent=q||'No research question set';
+  const cs=DATA.current_stage||'';
+  const si=DATA.stage_info||{};
+  const info=si[cs]||{};
+  const stg=DATA.stages||[];
+  const cur=stg.find(s=>s.status==='active')||{};
+  // Stats grid
+  const cards=[
+    {l:'Stage',v:(cs||'–').replace(/_/g,' '),sm:true},
+    {l:'Version',v:'v'+DATA.current_version},
+    {l:'Cost',v:'$'+DATA.total_cost},
+    {l:'Duration',v:fmtDur(DATA.total_duration||0)},
+    {l:'Artifacts',v:DATA.artifact_count||0},
+    {l:'Iterations',v:cur.iteration||0},
+  ];
+  document.getElementById('ovGrid').innerHTML=cards.map(c=>`<div class="ov-card"><div class="ov-label">${c.l}</div><div class="ov-val${c.sm?' sm':''}">${c.v}</div></div>`).join('');
+  // Stage description
+  const desc=cur.description||'';
+  const gv=cur.gate_verdict;
+  const gvHtml=gv?` &mdash; Gate: <span class="vd vd-${gv}">${gv}</span>`:'';
+  document.getElementById('ovStageDesc').innerHTML=desc?`<b>${(cs||'').replace(/_/g,' ')}</b>: ${desc}${gvHtml}`:'';
+}
+function fmtDur(s){if(s<60)return s.toFixed(0)+'s';if(s<3600)return (s/60).toFixed(1)+'m';return (s/3600).toFixed(1)+'h'}
+
 // ============ STAGES ============
 function renderStages(){
   const el=document.getElementById('stagesBar');el.innerHTML='';
   STAGES.forEach(s=>{
     const bk=(CFG.agents||{})[s.agent]||{};
+    const si=(DATA.stage_info||{})[s.name]||{};
     const d=document.createElement('div');d.className='schip '+s.status;
-    d.innerHTML=`v${s.index}.x ${s.name.replace(/_/g,' ')}<span class="al">${s.agent} (${bk.backend||'claude'})</span>`;
+    const iter=s.iteration||0;
+    const gv=s.gate_verdict;
+    const gvTag=gv?`<span style="font-size:9px;font-weight:600;color:${gv==='PASS'?'var(--gr)':gv==='FAIL'?'var(--rd)':'var(--yl)'}">${gv}</span>`:'';
+    // Show stage description inline (not just tooltip)
+    const desc=s.description||'';
+    const descHtml=desc?`<div style="font-size:10px;line-height:1.3;margin-top:3px;opacity:0.85;white-space:normal">${desc}</div>`:'';
+    d.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><span>v${s.index}.x ${s.name.replace(/_/g,' ')}${iter>1?` <span class="iter">${iter}</span>`:''}</span>${gvTag}</div>${descHtml}<span class="al">${s.agent} (${bk.backend||'claude'})${si.cost_usd?' · $'+si.cost_usd:''}</span>`;
     el.appendChild(d);
   });
 }
 
 // ============ TIMELINE ============
-let versions={},sortedV=[];
+let versions={},sortedV=[],_lastAutoSelVer='';
 function renderTimeline(){
   versions={};
   DATA.timeline.forEach(e=>{if(!versions[e.version])versions[e.version]={events:[],stage:e.stage};versions[e.version].events.push(e)});
   sortedV=Object.keys(versions).sort((a,b)=>{const[ma,ia]=a.split('.').map(Number),[mb,ib]=b.split('.').map(Number);return ma!==mb?ma-mb:ia-ib});
+
+  // Populate stage filter dropdown (preserve selection)
+  const fs=document.getElementById('tlFilterStage'),fv=fs.value;
+  const stagesInTl=[...new Set(Object.values(versions).map(v=>v.stage))];
+  fs.innerHTML='<option value="">All stages</option>'+stagesInTl.map(s=>`<option value="${s}"${s===fv?' selected':''}>${s.replace(/_/g,' ')}</option>`).join('');
+
+  // Apply filter
+  const filter=fs.value;
+  const filtered=filter?sortedV.filter(v=>versions[v].stage===filter):sortedV;
+
   const el=document.getElementById('timeline');el.innerHTML='';
-  sortedV.forEach(v=>{
+  if(!filtered.length){el.innerHTML='<div style="padding:16px;text-align:center;color:var(--dim);font-size:11px">'+(DATA.timeline.length?'No events match filter':'No events yet. Start the pipeline to see activity here.')+'</div>';return}
+  filtered.forEach(v=>{
     const g=versions[v],hp=g.events.some(e=>e.event_type==='gate_passed'),hf=g.events.some(e=>e.event_type==='gate_failed');
     const d=document.createElement('div');d.className='vg';
     d.innerHTML=`<div class="vh" data-v="${v}" onclick="selVer('${v}',this)"><span>v${v} ${hp?'\u2713':hf?'\u2717':''}</span><span class="stag">${g.stage.replace(/_/g,' ')}</span></div><div class="ves">${g.events.map(e=>`<div class="ve"><span class="ico" style="color:${ICOLORS[e.event_type]||'var(--dim)'}">${ICONS[e.event_type]||'\u00B7'}</span><span>${e.summary.substring(0,40)}</span></div>`).join('')}</div>`;
     el.appendChild(d);
   });
-  if(sortedV.length){const l=sortedV[sortedV.length-1];const e=document.querySelector(`.vh[data-v="${l}"]`);if(e)selVer(l,e)}
+  // Auto-select latest version ONLY when new events arrive, not on every poll
+  if(filtered.length){const l=filtered[filtered.length-1];if(l!==_lastAutoSelVer){_lastAutoSelVer=l;const e=document.querySelector(`.vh[data-v="${l}"]`);if(e)selVer(l,e)}}
 }
 
 let dtid=0;
@@ -825,10 +1213,11 @@ function selVer(v,el){
     let h=`<div class="ec-hdr"><div style="display:flex;align-items:center;gap:5px;flex-wrap:wrap">${ev.agent?`<span class="ab ${ac}">${ev.agent}</span>`:''}<span class="ev-s">${ev.summary}</span>${ev.gate_verdict?`<span class="vd ${vc}">${ev.gate_verdict}</span>`:''}</div><span class="ev-m">${ev.timestamp.substring(11,19)}${cs}${ds}</span></div>`;
     if(ev.scores&&Object.keys(ev.scores).length)h+='<div class="scores">'+Object.entries(ev.scores).map(([k,v])=>`<span class="sc ${v>=0.7?'p':'f'}">${k}:${v}</span>`).join('')+'</div>';
     const arts=[...(ev.artifacts_produced||[]),...(ev.artifacts_reviewed||[])];
-    if(arts.length)h+='<ul class="al-list">'+arts.map(a=>`<li>${a.split('/').pop()}</li>`).join('')+'</ul>';
+    if(arts.length)h+='<ul class="al-list">'+arts.map(a=>`<li style="cursor:pointer" onclick="viewArtifact('${a.replace(/'/g,"\\'")}')">${a.split('/').pop()}</li>`).join('')+'</ul>';
     if(ev.detail){const tid='d'+(++dtid);const esc=ev.detail.replace(/&/g,'&amp;').replace(/</g,'&lt;');const il=ev.detail.length>300;
-      h+=`<div class="dtxt${il?'':' exp'}" id="${tid}" onclick="this.classList.toggle('exp')">${esc}</div>`;
-      if(il)h+=`<div class="dtog" onclick="document.getElementById('${tid}').classList.toggle('exp')">more/less</div>`}
+      h+=`<div class="dtxt${il?'':' exp'}" id="${tid}">${esc}</div>`;
+      h+=`<div style="display:flex;gap:6px;margin-top:3px">${il?`<span class="dtog" onclick="document.getElementById('${tid}').classList.toggle('exp')">expand/collapse</span>`:''}`;
+      h+=`<button class="btn-view" onclick="openViewer('${ev.summary.replace(/'/g,"\\'")}',document.getElementById('${tid}').textContent)">View Full \u2197</button></div>`}
     c.innerHTML=h;sc.appendChild(c);
   });
 }
@@ -865,18 +1254,19 @@ function saveSettings(){
 }
 
 // ============ PIPELINE CONTROL ============
-function doAuto(){postAPI('/api/pipeline/auto',{until:document.getElementById('untilStage').value,max_rev:parseInt(document.getElementById('maxRev').value),instruction:document.getElementById('instrInput').value})}
-function doStep(){postAPI('/api/pipeline/step',{instruction:document.getElementById('instrInput').value})}
-function doReview(){postAPI('/api/pipeline/review',{})}
-function doApprove(){postAPI('/api/pipeline/approve',{})}
+function doAuto(b){postAPI('/api/pipeline/auto',{until:document.getElementById('untilStage').value,max_rev:parseInt(document.getElementById('maxRev').value),instruction:document.getElementById('instrInput').value},b)}
+function doStep(b){postAPI('/api/pipeline/step',{instruction:document.getElementById('instrInput').value},b)}
+function doReview(b){postAPI('/api/pipeline/review',{},b)}
+function doApprove(){const fb=document.getElementById('gateFeedback').value;postAPI('/api/pipeline/approve',{feedback:fb});document.getElementById('gateFeedback').value=''}
+function doReject(){const fb=document.getElementById('gateFeedback').value;if(!fb){appendCon('Please provide feedback when rejecting.',true);return}postAPI('/api/pipeline/reject',{feedback:fb});document.getElementById('gateFeedback').value=''}
 function doStop(){postAPI('/api/pipeline/stop',{})}
-function postAPI(url,data){
+function postAPI(url,data,btn){
+  if(btn){btn.disabled=true;btn._origText=btn.textContent;btn.textContent='...'}
   fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
   .then(r=>r.json()).then(d=>{
     if(d.error)appendCon('ERROR: '+d.error,true);
-    // Immediately poll for status update
     setTimeout(pollStatus,300);
-  });
+  }).finally(()=>{if(btn){btn.disabled=false;btn.textContent=btn._origText}});
 }
 
 // ============ POLLING ============
@@ -894,14 +1284,19 @@ function pollStatus(){
         document.getElementById('verLabel').textContent='v'+sd.current_version;
         document.getElementById('costLabel').textContent='$'+sd.total_cost;
         document.getElementById('evCnt').textContent=sd.timeline.length;
-        renderTimeline();renderStages();
+        renderOverview();renderTimeline();renderStages();renderStats();
       });
     }
+    checkNotif();
     lastRunning=d.running;
     // Adaptive poll rate
     clearInterval(pollTimer);
     pollTimer=setInterval(pollStatus,d.running?2000:8000);
-  }).catch(()=>{});
+  }).catch(()=>{
+    const pill=document.getElementById('statusPill');
+    pill.className='status-pill idle';
+    document.getElementById('statusLabel').textContent='Connection lost';
+  });
 }
 
 function updateUI(){
@@ -916,7 +1311,9 @@ function updateUI(){
   document.getElementById('btnStep').disabled=r;
   document.getElementById('btnReview').disabled=r;
   document.getElementById('btnApprove').style.display=w?'inline-block':'none';
-  document.getElementById('btnStop').style.display=r?'inline-block':'none';
+  document.getElementById('gateFeedback').style.display=w?'inline-block':'none';
+  document.getElementById('btnReject').style.display=w?'inline-block':'none';
+  document.getElementById('btnStop').style.display=r&&!w?'inline-block':'none';
   // Sidebar running indicator
   renderSidebar();
 }
@@ -927,10 +1324,37 @@ function appendCon(msg,isErr){
   d.textContent=msg;el.appendChild(d);el.scrollTop=el.scrollHeight;
 }
 
+// ============ FULL-SCREEN VIEWER ============
+function openViewer(title,content){
+  document.getElementById('viewerTitle').textContent=title;
+  document.getElementById('viewerBody').textContent=content;
+  document.getElementById('viewerBg').classList.add('vis');
+}
+function closeViewer(){document.getElementById('viewerBg').classList.remove('vis')}
+function copyViewer(){
+  const t=document.getElementById('viewerBody').textContent;
+  navigator.clipboard.writeText(t).then(()=>{
+    const b=document.querySelector('#viewerBg .btn');if(b){b.textContent='Copied!';setTimeout(()=>b.textContent='Copy',1500)}
+  });
+}
+function viewArtifact(path){
+  fetch('/api/artifact?path='+encodeURIComponent(path)).then(r=>r.json()).then(d=>{
+    if(d.ok)openViewer(path.split('/').pop(),d.content);
+    else appendCon('Error loading artifact: '+(d.error||'unknown'),true);
+  });
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeViewer()});
+
 // ============ PROJECT MANAGEMENT ============
 function switchProject(pid){
-  postAPI('/api/project/switch',{id:pid});
-  setTimeout(()=>location.reload(),400);
+  fetch('/api/project/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:pid})}).then(()=>
+    Promise.all([fetch('/api/state').then(r=>r.json()),fetch('/api/status').then(r=>r.json()),fetch('/api/projects').then(r=>r.json()),fetch('/api/config').then(r=>r.json())])
+  ).then(([sd,st,prj,cfg])=>{
+    DATA=sd;PIPE=st;PROJECTS=prj;CFG=cfg;PID=pid;lastLogLen=0;
+    document.getElementById('conBody').innerHTML='';
+    STAGES=sd.stages||[];
+    init();
+  });
 }
 function delProject(pid){
   if(pid===PID){appendCon('Cannot delete active project',true);return}
@@ -947,7 +1371,65 @@ function createProject(){
   fetch('/api/project/create',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,question:q})}).then(r=>r.json()).then(d=>{if(d.ok)location.reload()});
 }
 
+// ============ BROWSER NOTIFICATIONS ============
+let lastWaiting=false,notifEnabled=false;
+function enableNotif(){
+  if(!('Notification' in window))return;
+  Notification.requestPermission().then(p=>{notifEnabled=p==='granted'});
+}
+function checkNotif(){
+  if(!notifEnabled)return;
+  if(PIPE.waiting_approval&&!lastWaiting)new Notification('Approval Needed',{body:'Human gate reached. Review and approve.'});
+  if(lastRunning&&!PIPE.running)new Notification('Pipeline Finished',{body:'Research pipeline has stopped.'});
+  lastWaiting=PIPE.waiting_approval;
+}
+
+// ============ KEYBOARD SHORTCUTS ============
+document.addEventListener('keydown',e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;
+  if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();if(!PIPE.running)doAuto()}
+  if(e.ctrlKey&&e.key==='.'){e.preventDefault();doStop()}
+});
+
+// ============ STATS PANEL ============
+function renderStats(){
+  const si=DATA.stage_info||{};const el=document.getElementById('statsContent');
+  // Cost per stage
+  const costEntries=STAGE_NAMES.map(s=>({name:s.replace(/_/g,' '),val:(si[s]||{}).cost_usd||0}));
+  const maxCost=Math.max(...costEntries.map(e=>e.val),0.001);
+  // Duration per stage
+  const durEntries=STAGE_NAMES.map(s=>({name:s.replace(/_/g,' '),val:(si[s]||{}).duration_s||0}));
+  const maxDur=Math.max(...durEntries.map(e=>e.val),1);
+  // Per-agent cost
+  const agentCost={};(DATA.timeline||[]).forEach(e=>{if(e.agent&&e.cost_usd)agentCost[e.agent]=(agentCost[e.agent]||0)+e.cost_usd});
+  const maxAC=Math.max(...Object.values(agentCost),0.001);
+
+  let h='<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">';
+  h+='<div><h4 style="font-size:11px;color:var(--dim);margin-bottom:8px">Cost per Stage</h4>';
+  costEntries.forEach(e=>{h+=`<div class="stat-row"><span class="stat-lbl">${e.name}</span><div class="stat-bar"><div class="stat-fill" style="width:${(e.val/maxCost*100).toFixed(1)}%;background:var(--bl)"></div></div><span class="stat-val">$${e.val.toFixed(3)}</span></div>`});
+  h+='</div><div><h4 style="font-size:11px;color:var(--dim);margin-bottom:8px">Duration per Stage</h4>';
+  durEntries.forEach(e=>{h+=`<div class="stat-row"><span class="stat-lbl">${e.name}</span><div class="stat-bar"><div class="stat-fill" style="width:${(e.val/maxDur*100).toFixed(1)}%;background:var(--gr)"></div></div><span class="stat-val">${fmtDur(e.val)}</span></div>`});
+  h+='</div></div>';
+  if(Object.keys(agentCost).length){
+    h+='<h4 style="font-size:11px;color:var(--dim);margin:12px 0 8px">Cost per Agent</h4>';
+    Object.entries(agentCost).sort((a,b)=>b[1]-a[1]).forEach(([a,v])=>{h+=`<div class="stat-row"><span class="stat-lbl">${a}</span><div class="stat-bar"><div class="stat-fill" style="width:${(v/maxAC*100).toFixed(1)}%;background:var(--pu)"></div></div><span class="stat-val">$${v.toFixed(3)}</span></div>`});
+  }
+  el.innerHTML=h;
+}
+
+// ============ CONSOLE SEARCH ============
+function conSearch(q){
+  const lines=document.getElementById('conBody').children;
+  for(const l of lines){
+    if(!q){l.style.display='';l.innerHTML=l.textContent;continue}
+    const t=l.textContent;
+    if(t.toLowerCase().includes(q.toLowerCase())){l.style.display='';const re=new RegExp('('+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');l.innerHTML=t.replace(re,'<mark style="background:var(--yl);color:var(--bg);padding:0 1px;border-radius:2px">$1</mark>')}
+    else l.style.display='none';
+  }
+}
+
 // Start
+enableNotif();
 init();
 pollTimer=setInterval(pollStatus,PIPE.running?2000:8000);
 </script>
@@ -958,8 +1440,24 @@ pollTimer=setInterval(pollStatus,PIPE.running?2000:8000);
 # Helpers
 # ---------------------------------------------------------------------------
 
-def build_gui_data(state: ProjectState) -> dict:
+def _load_stage_descriptions(base_dir: Path) -> dict[str, str]:
+    """Load stage descriptions from stages.yaml."""
+    p = base_dir / "config" / "stages.yaml"
+    if not p.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(p.read_text()) or {}
+        return {k: v.get("description", "") for k, v in cfg.get("stages", {}).items()}
+    except Exception:
+        return {}
+
+
+def build_gui_data(state: ProjectState, base_dir: Path | None = None) -> dict:
     ci = STAGE_ORDER.index(state.current_stage)
+
+    # Load stage descriptions
+    stage_descs = _load_stage_descriptions(base_dir) if base_dir else {}
+
     stages = []
     for i, s in enumerate(STAGE_ORDER):
         gates = [g for g in state.gate_results if g.stage == s]
@@ -969,30 +1467,68 @@ def build_gui_data(state: ProjectState) -> dict:
             st = "failed" if gates and gates[-1].status.value == "failed" else "active"
         else:
             st = ""
-        stages.append({"index": i, "name": s.value, "agent": STAGE_PRIMARY_AGENT[s].value, "status": st})
+        # Latest gate verdict for this stage
+        latest_verdict = ""
+        if gates:
+            for ev in reversed(state.timeline):
+                if ev.stage == s and ev.gate_verdict:
+                    latest_verdict = ev.gate_verdict
+                    break
+        stages.append({
+            "index": i, "name": s.value, "agent": STAGE_PRIMARY_AGENT[s].value,
+            "status": st, "description": stage_descs.get(s.value, ""),
+            "iteration": state.iteration_count.get(s.value, 0),
+            "gate_verdict": latest_verdict,
+        })
+
+    # Per-stage cost and duration from timeline
+    stage_info = {}
+    for s in STAGE_ORDER:
+        cost = sum(e.cost_usd for e in state.timeline if e.stage == s)
+        dur = sum(e.duration_seconds for e in state.timeline if e.stage == s)
+        art_count = len([a for a in state.artifacts if a.stage == s])
+        stage_info[s.value] = {"cost_usd": round(cost, 4), "duration_s": round(dur, 1),
+                               "artifact_count": art_count}
 
     timeline = []
     for ev in state.timeline:
         timeline.append({
             "version": ev.version, "event_type": ev.event_type.value,
             "agent": ev.agent.value if ev.agent else None, "stage": ev.stage.value,
-            "summary": ev.summary, "detail": ev.detail,
+            "summary": ev.summary, "detail": _ANSI_RE.sub('', ev.detail or ''),
             "artifacts_produced": ev.artifacts_produced, "artifacts_reviewed": ev.artifacts_reviewed,
             "gate_verdict": ev.gate_verdict, "scores": ev.scores,
             "cost_usd": ev.cost_usd, "duration_seconds": ev.duration_seconds,
             "timestamp": ev.timestamp.isoformat(),
         })
 
+    # Total duration
+    total_dur = sum(e.duration_seconds for e in state.timeline)
+
+    # Artifact summary
+    artifact_summary = [
+        {"type": a.artifact_type.value, "version": a.version,
+         "stage": a.stage.value, "path": a.path}
+        for a in state.artifacts
+    ]
+
     return {
         "project_name": state.name, "project_id": state.project_id,
+        "research_question": state.research_question or "",
         "current_version": state.current_version(),
+        "current_stage": state.current_stage.value,
         "total_cost": f"{state.total_cost():.4f}",
+        "total_duration": round(total_dur, 1),
+        "artifact_count": len(state.artifacts),
+        "stage_info": stage_info,
+        "artifact_summary": artifact_summary,
         "timeline": timeline, "stages": stages,
     }
 
 
-def render_html(state: ProjectState, config: dict, projects: list, pipe_status: dict) -> str:
-    data = build_gui_data(state)
+def render_html(state: ProjectState, config: dict, projects: list, pipe_status: dict,
+                base_dir: Path | None = None) -> str:
+    data = build_gui_data(state, base_dir=base_dir)
     oc_models = _get_opencode_models()
     proj_list = [{"id": p.project_id, "name": p.name, "stage": p.current_stage.value} for p in projects]
 
@@ -1016,7 +1552,7 @@ def render_html(state: ProjectState, config: dict, projects: list, pipe_status: 
 # HTTP Server
 # ---------------------------------------------------------------------------
 
-def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
+def run_gui(sm: StateManager, project_id: Optional[str], config: dict, port: int = 8080):
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
     base_dir = sm.base_dir
@@ -1053,11 +1589,13 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
                 self._reload_cfg()
                 pid = runner.project_id or project_id
                 try:
-                    state = sm.load_project(pid)
-                except FileNotFoundError:
+                    state = sm.load_project(pid) if pid else None
+                except Exception:
+                    state = None
+                if state is None:
                     state = ProjectState(project_id="none", name="No Project", research_question="")
                 projects = sm.list_projects()
-                html = render_html(state, config, projects, runner.get_status())
+                html = render_html(state, config, projects, runner.get_status(), base_dir=base_dir)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.end_headers()
@@ -1066,9 +1604,12 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
             elif self.path == "/api/state":
                 pid = runner.project_id or project_id
                 try:
-                    state = sm.load_project(pid)
-                    self._json_ok(build_gui_data(state))
-                except FileNotFoundError:
+                    state = sm.load_project(pid) if pid else None
+                except Exception:
+                    state = None
+                if state:
+                    self._json_ok(build_gui_data(state, base_dir=base_dir))
+                else:
                     self._json_ok({"timeline": [], "stages": [], "current_version": "0.0", "total_cost": "0"})
 
             elif self.path == "/api/status":
@@ -1081,6 +1622,28 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
             elif self.path == "/api/config":
                 self._reload_cfg()
                 self._json_ok(config)
+
+            elif self.path.startswith("/api/artifact"):
+                import urllib.parse
+                params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                rel_path = params.get("path", [""])[0]
+                pid = runner.project_id or project_id
+                if pid and rel_path:
+                    # Handle both relative and projects/-prefixed paths
+                    if rel_path.startswith("projects/"):
+                        full = base_dir / rel_path
+                    else:
+                        full = base_dir / "projects" / pid / rel_path
+                    if full.exists() and full.stat().st_size < 500_000:
+                        try:
+                            content = full.read_text(encoding="utf-8")
+                            self._json_ok({"ok": True, "content": content, "path": rel_path})
+                        except Exception as e:
+                            self._json_ok({"ok": False, "error": str(e)})
+                    else:
+                        self._json_ok({"ok": False, "error": "Not found or too large"})
+                else:
+                    self._json_ok({"ok": False, "error": "Missing path or project"})
 
             else:
                 self.send_error(404)
@@ -1157,7 +1720,11 @@ def run_gui(sm: StateManager, project_id: str, config: dict, port: int = 8080):
                     self._json_ok({"ok": True})
 
             elif self.path == "/api/pipeline/approve":
-                runner.approve()
+                runner.approve(body.get("feedback", ""))
+                self._json_ok({"ok": True})
+
+            elif self.path == "/api/pipeline/reject":
+                runner.reject(body.get("feedback", ""))
                 self._json_ok({"ok": True})
 
             elif self.path == "/api/pipeline/stop":

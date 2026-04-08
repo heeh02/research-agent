@@ -34,6 +34,7 @@ class CodexReviewResult:
     suggestions: list[str] = field(default_factory=list)
     strongest_objection: str = ""
     what_would_make_it_pass: str = ""
+    failure_type: str = ""  # structural_issue, implementation_bug, design_flaw, etc.
     exit_code: int = 0
 
 
@@ -54,9 +55,9 @@ def run_codex_exec(
     if model:
         cmd.extend(["--model", model])
 
-    # Pass reasoning effort to codex
+    # Pass reasoning effort via -c config override (codex CLI has no --reasoning-effort flag)
     if effort and effort != "none":
-        cmd.extend(["--reasoning-effort", effort])
+        cmd.extend(["-c", f'reasoning_effort="{effort}"'])
 
     if json_output:
         cmd.append("--json")
@@ -130,7 +131,7 @@ ARTIFACT TO REVIEW (latest version only):
 ---
 
 Produce your review as YAML in ```yaml ... ``` fences with these fields:
-verdict, scores, blocking_issues, suggestions, strongest_objection, what_would_make_it_pass
+verdict, failure_type (required if REVISE/FAIL: one of structural_issue, implementation_bug, design_flaw, hypothesis_needs_revision, evidence_insufficient, hypothesis_falsified, analysis_gap), scores, blocking_issues, suggestions, strongest_objection, what_would_make_it_pass
 """
 
 
@@ -173,6 +174,9 @@ def parse_codex_review(raw_output: str) -> CodexReviewResult:
                 )
                 result.what_would_make_it_pass = str(
                     data.get("what_would_make_it_pass", "")
+                )
+                result.failure_type = str(
+                    data.get("failure_type", "")
                 )
                 return result
         except (yaml.YAMLError, ValueError):

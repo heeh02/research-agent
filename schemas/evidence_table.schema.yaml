@@ -1,0 +1,12 @@
+# Schema for evidence_table artifact
+required_fields:
+  - research_question
+  - entries
+
+field_types:
+  research_question: string
+  entries: list
+  summary: string
+
+min_lengths:
+  entries: 3

@@ -47,7 +47,7 @@ from ..models import (
 class CriticAgent:
     """Adversarial reviewer powered by OpenAI Codex.
 
-    Unlike other agents that inherit BaseAgent (and call LLM APIs directly),
+    Unlike the Researcher and Engineer (which run as CLI subprocesses),
     the Critic uses the Codex CLI as its backend. This provides:
     - True independent perspective (different model family)
     - Codebase-aware reviews (Codex reads files in sandbox)

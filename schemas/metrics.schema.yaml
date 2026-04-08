@@ -1,0 +1,20 @@
+# Schema for metrics artifact
+required_fields:
+  - experiment_name
+  - metrics_summary
+
+field_types:
+  experiment_name: string
+  metrics_summary: list
+
+min_lengths:
+  metrics_summary: 1
+
+min_string_lengths:
+  experiment_name: 5
+
+# Each metric entry must have a name and a current value
+list_item_fields:
+  metrics_summary:
+    - name
+    - current

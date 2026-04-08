@@ -14,3 +14,11 @@ projects/*/state.json.tmp
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+.DS_Store
+
+# Runtime: checkpoint files and experiment results
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+experiments/*/results/

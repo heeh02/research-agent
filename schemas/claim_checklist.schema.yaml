@@ -1,0 +1,11 @@
+# Schema for claim_checklist artifact
+required_fields:
+  - claims
+  - overall_status
+
+field_types:
+  claims: list
+  overall_status: mapping
+
+min_lengths:
+  claims: 1

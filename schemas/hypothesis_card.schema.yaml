@@ -31,3 +31,22 @@ min_lengths:
   testable_predictions: 2
   key_risks: 2
   kill_criteria: 2
+
+min_string_lengths:
+  claim: 30
+  motivation: 30
+  minimum_viable_experiment: 20
+
+# Each risk must have a description and mitigation
+list_item_fields:
+  key_risks:
+    - risk
+    - mitigation
+  testable_predictions:
+    - prediction
+
+cross_field_checks:
+  # kill_criteria should have at least as many items as testable_predictions
+  - rule: list_length_gte
+    field_a: kill_criteria
+    field_b: testable_predictions
