@@ -581,19 +581,18 @@ echo "$_EXIT" > {shlex.quote(done_path)}
 
         # --- Visible Terminal mode: real interactive Claude Code ---
         if self.visible_terminal:
-            tmpdir = tempfile.mkdtemp(prefix="ra-terminal-")
-            prompt_path = os.path.join(tmpdir, "prompt.txt")
-            with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write(prompt)
-            # Launch interactive `claude` with the prompt.
-            # The user sees the full TUI (thinking, tool calls, file writes).
-            # `claude` maintains session context for `claude -c` continuation.
+            # Write prompt as TASK.md in project dir — Claude reads it naturally.
+            # Avoids shell quoting issues with long/complex prompts as CLI args.
+            task_file = self.project_dir / "TASK.md"
+            task_file.write_text(prompt, encoding="utf-8")
+            kickoff = "Read TASK.md and execute the task. Write output artifacts to the paths specified in the task card."
             shell_body = (
                 f"claude"
                 f" --model {shlex.quote(model)}"
                 f" --effort {shlex.quote(effort)}"
                 f" --allowedTools {shlex.quote(allowed_tools)}"
-                f' "$(cat {shlex.quote(prompt_path)})"'
+                f" {shlex.quote(kickoff)}"
+                f"\nrm -f TASK.md"
             )
             _, exit_code = self._open_terminal(
                 title=f"Claude Code — {model} ({effort})",
@@ -601,7 +600,9 @@ echo "$_EXIT" > {shlex.quote(done_path)}
                 cwd=str(self.project_dir),
                 timeout=timeout,
             )
-            # Cost: estimate from prompt length (no JSON capture in interactive mode)
+            # Clean up in case terminal didn't get to rm
+            task_file.unlink(missing_ok=True)
+            # Cost: estimate (no JSON capture in interactive mode)
             cost_usd, in_tok, out_tok = self._estimate_cost_from_text(prompt, "", model)
             return "Interactive session completed", exit_code, cost_usd, in_tok, out_tok
 
