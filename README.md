@@ -1,5 +1,7 @@
 # Research Agent
 
+[English](#table-of-contents) | [中文](#中文文档)
+
 A multi-agent system that automates the scientific research pipeline — from problem definition to result analysis — using isolated AI agents, structured quality gates, and human oversight.
 
 Each agent runs as an independent CLI subprocess (Claude Code / OpenAI Codex / OpenCode). The orchestrator is pure Python: it manages the state machine, dispatches agents, verifies experiment results independently, and routes the pipeline based on structured critic feedback.
@@ -481,21 +483,369 @@ Research directions:
 
 ---
 
-## 中文概述
+<a id="中文"></a>
 
-Research Agent 是一个多智能体自动化科研系统。它将研究流程拆分为 7 个阶段（问题定义 → 文献综述 → 假设形成 → 实验设计 → 代码实现 → 实验执行 → 结果分析），每个阶段由专职 AI agent 执行，经过对抗性评审后才能推进。
+## 中文文档
 
-**核心特点**：
-- **进程级隔离**：每个 agent 是独立的 CLI 子进程（Claude / Codex / OpenCode），不共享内存
-- **三层质量门控**：critic 评审 → 结构化预检查覆盖 → 加权分数覆盖，verdict 只能降级不能升级
-- **独立验证**：Orchestrator 独立落盘代码并运行测试，agent 不能伪造结果
-- **故障类型驱动回退**：critic 输出结构化 failure_type，pipeline 自动回退到正确的阶段
-- **可配置 backend**：每个 agent 的 CLI backend 和模型可独立配置，支持 Claude、Codex、OpenCode
+### 项目简介
 
-**快速开始**：
-```bash
-pip install -e .
-ra init "研究课题" -q "研究问题"
-python scripts/multi_agent.py auto    # 全自动运行
-python scripts/multi_agent.py gui     # Web GUI
+Research Agent 是一个多智能体自动化科研系统，通过隔离的 AI agent、结构化质量门控和人类监督，自动化从问题定义到结果分析的完整科研流程。
+
+每个 agent 以独立的 CLI 子进程运行（Claude Code / OpenAI Codex / OpenCode）。Orchestrator 是纯 Python 代码：管理状态机、调度 agent、独立验证实验结果，并根据 critic 的结构化反馈路由 pipeline。
+
+> **状态**：v0.2.0 — 可用的端到端 pipeline，支持 CLI 和 Web GUI。已用于机器人/VLA 研究项目，尚未在多领域大规模验证。
+
+### 为什么做这个项目
+
+做严谨的研究很难：研究者跳过文献综述，工程师在可复现性上偷工减料，没人愿意当自己的审稿人。这个系统通过职责分离来强制纪律：
+
+- **Researcher**（研究员）负责文献分析和假设形成 — 不能运行代码
+- **Engineer**（工程师）负责实验实现 — 不能修改假设
+- **Critic**（审稿人）对抗性审查一切 — 不能修改产物
+- **Orchestrator**（编排器，纯 Python）管理状态 — 独立验证代码执行和实验结果
+
+每个阶段必须通过质量门控才能推进。门控失败时，系统要么修订（同阶段），要么回退（到更早阶段），由 critic 识别的故障类型驱动。
+
+### 系统实际做什么
+
+运行 `python scripts/multi_agent.py auto` 后的端到端流程：
+
+1. **Orchestrator 读取**项目状态 `state.json`，确定当前阶段
+2. **构建 TaskCard**：组装阶段指令、前序产物上下文、之前的 critic 反馈
+3. **调度对应 agent**：启动 CLI 子进程（`claude -p`、`codex exec` 或 `opencode run`，取决于配置）
+4. **Agent 写入 YAML 产物**到 `projects/<id>/artifacts/<stage>/`
+5. **Orchestrator 验证输出**：解析 YAML、校验 schema、带版本号注册
+6. **实现/实验阶段额外步骤**：Orchestrator 独立将代码从 YAML 落盘、运行 pytest 和 smoke test、写入*已验证*的测试结果（覆盖 agent 的草稿）
+7. **运行结构化预检查**：检测 DummyDataset 使用、检查论文是否有 URL 字段、标记可疑的完美指标等
+8. **调度 Critic** 进行对抗性评审 — critic 输出结构化裁定（PASS/REVISE/FAIL）、各维度评分和 `failure_type`
+9. **三层门控评估**：critic 裁定 → 预检查覆盖 → 加权分数校验。裁定只能被*降级*，不能被升级
+10. **路由决策**：
+    - **PASS** → 推进到下一阶段
+    - **REVISE**（同阶段故障）→ 带着 critic 反馈重新调度 agent
+    - **FAIL**（跨阶段故障）→ 根据 `failure_type` 回退到对应阶段
+    - **人类门控**（假设形成和实验阶段）→ 暂停等待人工批准
+11. **重复**直到 pipeline 完成或修订次数耗尽
+
+### 核心设计决策
+
+| 决策 | 原因 |
+|------|------|
+| **Agent 是 CLI 子进程，不是库调用** | 真正的进程级隔离。每个 agent 有独立的上下文、工具集和崩溃边界。Orchestrator 能存活于 agent 崩溃 |
+| **通过 YAML 文件通信，不通过消息** | 磁盘上的产物可审计、可版本化、不需要共享内存。添加新 agent 不需要修改通信协议 |
+| **Verdict 默认 REVISE，永不默认 PASS** | 如果 critic 的输出无法解析，安全默认是要求修订。缺失的评分计为 0.0。防止质量被绕过 |
+| **Orchestrator 独立验证执行** | Agent 不能自报测试通过。Orchestrator 落盘代码并实际运行，然后写入自己的已验证产物 |
+| **故障类型驱动回退路由** | 不是泛泛地"重试"，而是 critic 分类*为什么*失败（设计缺陷、假设需修改等），pipeline 路由到对应的早期阶段 |
+
+### 架构
+
 ```
+Python Orchestrator（scripts/multi_agent.py 或 gui.py）
+│
+├── [Claude CLI]    →  Researcher Agent  ← agents/researcher/CLAUDE.md
+│   默认：claude -p, Claude Opus 4
+│   工具：Read, Write, Glob, Grep, WebSearch, WebFetch, Agent
+│
+├── [OpenCode CLI]  →  Engineer Agent    ← agents/engineer/CLAUDE.md
+│   默认：opencode run, Doubao Seed 2.0 Code
+│   工具：Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Agent
+│
+├── [Codex CLI]     →  Critic Agent      ← agents/critic/CLAUDE.md
+│   默认：codex exec, GPT-5.4
+│   权限：完整项目沙箱（只读）
+│
+├── Orchestrator 执行（纯 Python，无 LLM 调用）
+│   - 从 YAML 中提取代码落盘
+│   - 运行 pytest 和 smoke test
+│   - 从输出文件和 stdout 解析 metrics
+│   - 写入已验证的 test_result 和 metrics 产物
+│
+└── 人类门控
+    需要人工批准的阶段：hypothesis_formation, experimentation
+```
+
+**后端灵活性**：每个 agent 的 CLI 后端和模型都可以通过 `config/settings.yaml` 或 Web GUI 独立配置。可以所有 agent 都用 Claude，也可以混合使用 Claude + Codex + OpenCode，甚至每个角色用不同的模型。
+
+### 7 阶段 Pipeline
+
+Pipeline 是一个有 7 个有序阶段的有限状态机。每个阶段有主 agent、所需产物和加权门控标准。
+
+| # | 阶段 | 主 Agent | 审查者 | 所需产物 | 人类门控 |
+|---|------|---------|--------|---------|---------|
+| 0 | 问题定义 | Researcher | Critic | `problem_brief` | 否 |
+| 1 | 文献综述 | Researcher | Critic | `literature_map`, `evidence_table` | 否 |
+| 2 | 假设形成 | Researcher | Critic | `hypothesis_card` | **是** |
+| 3 | 实验设计 | Engineer | Critic | `experiment_spec` | 否 |
+| 4 | 代码实现 | Engineer | Critic | `code`, `test_result` | 否 |
+| 5 | 实验执行 | Engineer | Engineer | `run_manifest`, `metrics` | **是** |
+| 6 | 结果分析 | Researcher | Critic | `result_report`, `claim_checklist` | 否 |
+
+#### 状态转换
+
+前进需要门控通过。后退（回退）由特定的故障类型触发：
+
+```
+前进（需门控通过）：
+  问题定义 → 文献综述 → 假设形成 → 实验设计 → 代码实现 → 实验执行 → 结果分析
+
+后退（故障类型驱动）：
+  假设形成  ← 文献综述       （需要更多证据）
+  实验设计  ← 假设形成       （假设需修改）
+  代码实现  ← 实验设计       （发现设计缺陷）
+  实验执行  ← 代码实现       （发现代码 bug）
+  结果分析  ← 实验执行       （需要更多实验）
+  结果分析  → 假设形成       （假设被证伪）
+```
+
+#### 修订循环
+
+当门控以同阶段故障类型失败时，agent 会带着 critic 反馈被重新调度，最多重复 `max_iterations`（默认：5）次。每次迭代通过语义版本号追踪：`major.minor`，其中 `major` = 阶段索引（0-6），`minor` = 阶段内迭代次数。
+
+### 三层质量门控
+
+每个阶段必须通过**三层质量门控**才能推进。每层只能*降级*裁定，不能升级。
+
+**第一层：Critic 评审**
+
+Critic agent 对每个阶段按加权标准评分（定义在 `config/stages.yaml` 中）。加权平均分须达到 `pass_threshold`（默认 0.7）且无阻塞性问题。Critic 还会输出 `failure_type`（7 种类型之一）决定 pipeline 是原地修订还是回退。
+
+**第二层：结构化预检查**
+
+在 critic 评审之前自动运行的检查，捕获常见失败模式：
+
+| 阶段 | 检查 | 作用 |
+|------|------|------|
+| 文献综述 | 论文 URL 字段存在性 | 标记缺少 `url` 字段的论文 |
+| 代码实现 | DummyDataset 检测 | 使用虚假数据则自动 REVISE |
+| 代码实现 | Orchestrator 独立测试执行 | 独立运行 pytest，写入已验证的 test_result |
+| 实验执行 | 指标造假检测 | 如果所有指标都"刚好"超过目标则标记 |
+| 结果分析 | Claim checklist 完成度 | 如果 < 50% 的 claim 已验证则 REVISE |
+
+如果预检查发现阻塞性问题而 critic 说了 PASS，裁定会被覆盖为 REVISE。
+
+**第三层：加权分数校验**
+
+如果 critic 说了 PASS 但加权平均分低于阈值，裁定被覆盖为 REVISE。缺失的评分字段计为 0.0 — agent 不能通过省略低分维度来绕过门控。
+
+### Agent 角色
+
+#### Researcher（研究员）
+
+负责所有知识工作：文献分析、缺口识别、假设形成、结果解读。
+
+- **工具**：Web 搜索、论文检索、结构化分析、子 agent 派生
+- **约束**：不能运行代码、不能设计实验（使用 Claude 后端时通过 `--allowedTools` 强制执行）
+- **引用规则**：每篇论文必须有 `url` 字段。不确定是否真实存在的论文必须标记 `verified: false`
+- **产物**：`problem_brief`、`literature_map`、`evidence_table`、`hypothesis_card`、`result_report`、`claim_checklist`
+
+#### Engineer（工程师）
+
+将假设转化为可执行实验。
+
+- **工具**：代码编写、测试、调试、Bash 执行、子 agent 派生
+- **约束**：不能修改假设、不能做质量判断
+- **代码规则**：必须使用真实数据集（使用 DummyDataset 自动 FAIL）、固定随机种子、包含测试
+- **草稿 vs 已验证**：Engineer 产出*草稿*测试结果。Orchestrator 独立落盘代码、运行测试，写入 Critic 审查的*已验证*产物
+- **产物**：`experiment_spec`、`code`、`test_result`、`run_manifest`、`metrics`
+
+#### Critic（审稿人）
+
+对抗性审查者，默认持怀疑态度。
+
+- **权限**：完整项目沙箱（只读）
+- **约束**：不能写文件、不能创建产物、不能运行命令
+- **输出**：结构化 YAML — 裁定（PASS/REVISE/FAIL）、各维度评分（0.0-1.0）、阻塞性问题、用于回退路由的 `failure_type`
+- **产物**：评审输出（仅 stdout，不写入文件）
+
+#### Orchestrator（编排器）
+
+Python 代码本身 — 不是 LLM agent。
+
+- 构建包含前序产物上下文和历史反馈的 TaskCard
+- 通过配置的 CLI 后端调度 agent
+- 验证并注册产出的产物
+- 独立落盘代码并运行测试（实现/实验阶段）
+- 通过三层系统评估门控裁定
+- 路由 pipeline：推进 / 修订 / 回退 / 人工升级
+- 追踪版本时间线、成本和状态转换
+
+### 安装与快速开始
+
+#### 前置要求
+
+- Python 3.11+
+- 至少安装一个 CLI 后端：
+  - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)（`claude --version`）
+  - [OpenAI Codex](https://github.com/openai/codex)（`npm install -g @openai/codex && codex login`）— 用于 critic 评审
+  - [OpenCode](https://github.com/opencode-ai/opencode)（可选，用于低成本工程任务）
+
+#### 安装
+
+```bash
+git clone <repo-url> && cd research-agent
+pip install -e .
+```
+
+#### 快速开始
+
+```bash
+# 1. 创建项目
+ra init "我的研究" -q "选择性注意力剪枝能否将 VLA 推理延迟降低 40%？"
+
+# 2. 全自动运行
+python scripts/multi_agent.py auto
+
+# 3. 或使用 Web GUI
+python scripts/multi_agent.py gui
+# 打开 http://127.0.0.1:8080
+```
+
+### 运行 Pipeline
+
+#### 全自动模式
+
+```bash
+python scripts/multi_agent.py auto                                    # 运行到完成或人类门控
+python scripts/multi_agent.py auto --until hypothesis_formation       # 运行到指定阶段
+python scripts/multi_agent.py auto -n 5                               # 每阶段最多 5 次修订
+```
+
+pipeline 自动运行，仅在人类门控处暂停（hypothesis_formation 和 experimentation），需要 `ra advance --approve` 批准。
+
+#### 逐步模式
+
+```bash
+python scripts/multi_agent.py step                    # 运行一次 agent + 一次评审
+python scripts/multi_agent.py step -i "重点关注 transformer 方法"
+python scripts/multi_agent.py review                  # 仅运行 critic 评审
+```
+
+#### 状态管理（`ra` CLI）
+
+```bash
+ra status                   # 查看 pipeline 状态和进度
+ra advance --approve        # 批准人类门控
+ra rollback literature_review --reason "需要更多论文"
+ra cost                     # 查看成本明细（按阶段/agent/模型）
+ra artifacts                # 列出所有产物
+ra history                  # 查看阶段转换历史
+ra projects                 # 列出所有项目
+ra use <project-id>         # 切换活跃项目
+```
+
+### Web GUI
+
+通过 `python scripts/multi_agent.py gui` 启动（默认：http://127.0.0.1:8080）。
+
+GUI 功能：
+
+- **项目侧边栏**：创建、切换、删除项目
+- **Pipeline 控制**：Auto、Step、Review、Stop、Approve/Reject 按钮
+- **阶段可视化**：带迭代次数和门控裁定的进度条
+- **版本时间线**：每次 agent 运行、门控评估、回退和人工决策
+- **详情面板**：每个事件的完整输出，含产物查看器
+- **设置面板**：运行时修改每个 agent 的 CLI 后端、模型和 effort
+- **控制台**：实时日志输出，支持搜索
+- **统计面板**：按阶段和 agent 的成本与耗时分析
+- **浏览器通知**：需要人工批准或 pipeline 结束时弹出提醒
+
+设置修改在下一个 pipeline 步骤生效，无需重启。
+
+### 配置
+
+所有配置在 `config/settings.yaml` 中：
+
+```yaml
+agents:
+  researcher:
+    backend: claude                           # claude | codex | opencode
+    model: claude-opus-4-20250514
+    effort: max
+    max_turns: 30
+  engineer:
+    backend: opencode
+    model: volcengine-plan/doubao-seed-2.0-code
+    effort: high
+    max_turns: 40
+  critic:
+    backend: codex
+    model: gpt-5.4
+    effort: xhigh
+
+pipeline:
+  human_gates: [hypothesis_formation, experimentation]
+  max_iterations: 5
+
+cost:
+  warning_threshold: 5.0    # 美元
+  hard_limit: 50.0
+```
+
+阶段特定的门控标准和权重定义在 `config/stages.yaml` 中。每个阶段定义：所需产物、加权门控标准（总和为 1.0）、通过阈值（默认 0.7）、主 agent 和审查者、是否需要人类门控。
+
+### 产物与状态
+
+#### 产物通信
+
+Agent 之间**完全通过**版本化的 YAML 文件通信。没有共享内存，agent 之间没有对话。
+
+产物命名规则 `<type>_v<version>.yaml`，版本单调递增。所有产物不可变 — 修订创建新版本，永不覆盖旧版本。
+
+Orchestrator 将前序产物的内容组装到每个 TaskCard 中，因此每个 agent 接收 pipeline 的累积知识，无需看到其他 agent 的原始输出。
+
+#### 状态持久化
+
+每个项目有唯一的真相源：`projects/<id>/state.json`，一个 JSON 序列化的 Pydantic 模型，包含：
+
+- 当前阶段和迭代次数
+- 所有产物（仅追加的注册表）
+- 所有门控结果（仅追加）
+- 阶段转换记录（前进和回退）
+- 成本记录（每次 API 调用的成本追踪）
+- 版本时间线（语义版本化的事件日志）
+
+**写入安全性**：状态写入使用排他文件锁（`fcntl.flock`）加原子性临时文件 + 重命名。如果进程崩溃，state.json 要么是旧版本要么是新版本，永远不会是部分写入。
+
+### 已知限制
+
+#### Agent 隔离是软性的
+
+Agent 工具限制（`--allowedTools`）仅在 Claude 后端生效。使用 OpenCode 或 Codex 时，agent 可访问所有工具。Sandbox 模块通过文件系统快照对比事后检测违规，但不能阻止违规发生。
+
+#### 无执行沙箱
+
+Orchestrator 在宿主环境中直接运行 agent 编写的代码（pytest、smoke test）。没有 Docker 容器或 VM 隔离。命令白名单（仅允许 `python`、`pytest`、`pip`，禁止 shell 操作符）可以缓解但不能消除风险。
+
+#### URL 验证仅检查结构
+
+文献综述的预检查只验证论文在 YAML 中是否有 `url` 字段 — 不检查该 URL 是否实际可访问。
+
+#### 独立验证仅限特定阶段
+
+只有代码实现和实验执行阶段有 Orchestrator 独立验证。其余阶段（问题定义、文献综述、假设形成、结果分析），agent 的输出即最终产物，由 critic 评审但不独立复现。
+
+#### 状态文件增长
+
+`state.json` 对产物、门控结果、转换记录和时间线事件使用仅追加列表。多次修订的项目中该文件会持续增长。目前没有压缩或归档机制。
+
+#### 单机运行
+
+系统运行在单台机器上。没有分布式调度、作业队列或云执行后端。
+
+### 路线图
+
+近期优先事项：
+
+- [ ] 提取共享 `PipelineEngine`，消除 CLI/GUI 逻辑重复
+- [ ] 将 GUI 前端（HTML/CSS/JS）移到独立静态文件
+- [ ] 加强 execution.py 中的命令验证
+- [ ] 为文献综述 URL 添加 HTTP HEAD 可达性验证
+- [ ] 长期项目的 state 压缩机制
+- [ ] 基于 Docker 的执行沙箱
+- [ ] 合并 CLI 入口（pipeline.py → ra CLI）
+
+研究方向：
+
+- Verdict 单调性属性的形式化验证
+- 跨领域 benchmark（超越机器人/VLA）
+- 多机 agent 调度 + 作业队列
+- 实验追踪集成（MLflow/W&B 脚手架已存在）
