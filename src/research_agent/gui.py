@@ -135,9 +135,12 @@ class PipelineRunner:
             self.log(f"Config updated. New settings apply to next step.")
 
     def log(self, msg: str):
-        self.log_lines.append({"t": datetime.now().strftime("%H:%M:%S"), "m": msg})
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log_lines.append({"t": ts, "m": msg})
         if len(self.log_lines) > 2000:
             self.log_lines = self.log_lines[-2000:]
+        # Mirror to terminal so the user can follow along in the CLI
+        print(f"[{ts}] {msg}", flush=True)
 
     def get_status(self) -> dict:
         return {
@@ -1561,6 +1564,10 @@ def run_gui(sm: StateManager, project_id: Optional[str], config: dict, port: int
     last_cfg_mtime = config_path.stat().st_mtime if config_path.exists() else 0
 
     class H(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            # Suppress HTTP access logs — they drown out pipeline output
+            pass
+
         def _json_ok(self, data):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

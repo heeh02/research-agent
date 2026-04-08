@@ -64,6 +64,9 @@ def run_codex_exec(
 
     cmd.append(prompt)
 
+    cmd_display = cmd[:-1] + [f"'({len(prompt)} chars)'"]
+    print(f"  $ {' '.join(cmd_display)}  (timeout {timeout}s)", flush=True)
+
     result = subprocess.run(
         cmd,
         cwd=project_dir or Path.cwd(),

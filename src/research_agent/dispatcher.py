@@ -464,6 +464,7 @@ class MultiAgentDispatcher:
             "--allowedTools", allowed_tools,
         ]
         timeout = 900 if effort == "max" else 600
+        print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
         # Use Popen (not run) so the process can be force-killed by stop()
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
@@ -532,6 +533,9 @@ class MultiAgentDispatcher:
         else:
             timeout = 600  # Critic / no-file tasks: 10 min max
         _log = progress_fn or (lambda msg: None)
+        # Show the CLI command (truncate prompt to keep it readable)
+        cmd_display = cmd[:-1] + [f"'({len(prompt)} chars)'"]
+        print(f"  $ {' '.join(cmd_display)}  (timeout {timeout}s)", flush=True)
 
         # Monitor opencode's tool-output directory for activity
         tool_dir = Path.home() / ".local" / "share" / "opencode" / "tool-output"
