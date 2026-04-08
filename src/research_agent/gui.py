@@ -1751,8 +1751,14 @@ def run_gui(sm: StateManager, project_id: Optional[str], config: dict, port: int
         def log_message(self, fmt, *args):
             pass
 
+    import socket as _socket
+
+    class _ReuseHTTPServer(HTTPServer):
+        allow_reuse_address = True
+        allow_reuse_port = True
+
     host = config.get("gui", {}).get("host", "127.0.0.1")
-    server = HTTPServer((host, port), H)
+    server = _ReuseHTTPServer((host, port), H)
     print(f"Research Agent GUI: http://{host}:{port}")
     print("Press Ctrl+C to stop.\n")
     try:
