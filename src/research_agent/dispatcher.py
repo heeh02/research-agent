@@ -466,68 +466,42 @@ class MultiAgentDispatcher:
         }.get(role, AgentToolset.ENGINEER.value)
 
     # -----------------------------------------------------------------------
-    # Visible Terminal — open CLI tool in a macOS Terminal.app window
+    # Visible Terminal — open CLI tool in a real Terminal.app window
     # -----------------------------------------------------------------------
 
-    def _run_in_terminal(
+    def _open_terminal(
         self,
         title: str,
-        cmd: list[str],
-        stdin_text: str | None = None,
-        timeout: int = 600,
+        shell_body: str,
         cwd: str | None = None,
+        timeout: int = 600,
+        expected_files: list[str] | None = None,
         cancel_event=None,
     ) -> tuple[str, int]:
-        """Run a command in a visible macOS Terminal.app window.
+        """Open a CLI tool in a macOS Terminal.app window.
 
-        The user sees the CLI tool running in real-time.  Output is also
-        captured to a file so the dispatcher can parse it afterwards.
+        The user sees the full interactive TUI.  The dispatcher polls for
+        output files on disk and a done-marker to know when to proceed.
 
         Returns (output_text, exit_code).
         """
         tmpdir = tempfile.mkdtemp(prefix="ra-terminal-")
-        output_path = os.path.join(tmpdir, "output.txt")
         done_path = os.path.join(tmpdir, "done.txt")
         pid_path = os.path.join(tmpdir, "pid.txt")
         self._terminal_pid_file = pid_path
 
-        cmd_str = " ".join(shlex.quote(c) for c in cmd)
-
-        # Build stdin redirect if prompt is provided
-        if stdin_text:
-            prompt_path = os.path.join(tmpdir, "prompt.txt")
-            with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write(stdin_text)
-            pipe_in = f"cat {shlex.quote(prompt_path)} | "
-            # PIPESTATUS[1] = exit code of the second command in the pipe
-            exit_var = "${PIPESTATUS[1]}"
-        else:
-            pipe_in = ""
-            exit_var = "${PIPESTATUS[0]}"
-
         cd_line = f"cd {shlex.quote(cwd)}" if cwd else ""
-        # Escape the command for display inside a bash echo (replace ' with '"'"')
-        cmd_display = cmd_str.replace("'", "'\"'\"'")
 
         script = f"""#!/bin/zsh
 {cd_line}
 echo $$ > {shlex.quote(pid_path)}
-print -P '%F{{cyan}}'
-echo "╔══════════════════════════════════════════════════════╗"
-printf '║  %-52s  ║\\n' "{title}"
-echo "╚══════════════════════════════════════════════════════╝"
-print -P '%f'
 echo ""
-print -P '%%F{{8}}$ {cmd_display}%%f'
+echo "  ┌─ {title}"
+echo "  └─ Working directory: $(pwd)"
 echo ""
-{pipe_in}{cmd_str} 2>&1 | tee {shlex.quote(output_path)}
-_EXIT=${{pipestatus[{2 if stdin_text else 1}]}}
+{shell_body}
+_EXIT=$?
 echo ""
-if [ "$_EXIT" = "0" ]; then
-  print -P '%F{{green}}════ Done (exit 0) ════%f'
-else
-  print -P "%F{{red}}════ Failed (exit $_EXIT) ════%f"
-fi
 echo "$_EXIT" > {shlex.quote(done_path)}
 """
         script_path = os.path.join(tmpdir, "run.sh")
@@ -535,17 +509,17 @@ echo "$_EXIT" > {shlex.quote(done_path)}
             f.write(script)
         os.chmod(script_path, 0o755)
 
-        # Open in Terminal.app — creates a new window/tab
-        osa_script = (
+        # Open in Terminal.app
+        osa = (
             'tell application "Terminal"\n'
             "  activate\n"
             f'  do script "{script_path}"\n'
             "end tell"
         )
-        subprocess.run(["osascript", "-e", osa_script], capture_output=True)
+        subprocess.run(["osascript", "-e", osa], capture_output=True)
         print(f"  [Terminal.app] Opened: {title}", flush=True)
 
-        # Poll for done marker
+        # Poll for done marker or expected files
         start_t = time.time()
         while time.time() - start_t < timeout:
             if cancel_event and cancel_event.is_set():
@@ -557,20 +531,24 @@ echo "$_EXIT" > {shlex.quote(done_path)}
 
         self._terminal_pid_file = None
 
-        # Read results
-        output = ""
-        if os.path.exists(output_path):
-            try:
-                output = open(output_path, encoding="utf-8", errors="replace").read()
-            except Exception:
-                pass
-
-        exit_code = 124  # default: timeout
+        exit_code = 124  # timeout
         if os.path.exists(done_path):
             try:
                 exit_code = int(open(done_path).read().strip())
             except (ValueError, OSError):
                 exit_code = 1
+
+        # Read the last log file written during this dispatch as output text
+        output = ""
+        if cwd:
+            log_dir = Path(cwd) / "projects"
+            for log_f in sorted(log_dir.rglob("logs/*.txt"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if log_f.stat().st_mtime >= start_t:
+                    try:
+                        output = log_f.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    break
 
         return output, exit_code
 
@@ -601,21 +579,31 @@ echo "$_EXIT" > {shlex.quote(done_path)}
         timeout = 900 if effort == "max" else 600
         print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode (macOS) ---
+        # --- Visible Terminal mode: real interactive Claude Code ---
         if self.visible_terminal:
-            raw, exit_code = self._run_in_terminal(
-                title=f"Claude Code — {model} ({effort})",
-                cmd=cmd,
-                stdin_text=prompt,
-                timeout=timeout,
-                cwd=str(self.project_dir),
+            tmpdir = tempfile.mkdtemp(prefix="ra-terminal-")
+            prompt_path = os.path.join(tmpdir, "prompt.txt")
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(prompt)
+            # Launch interactive `claude` with the prompt.
+            # The user sees the full TUI (thinking, tool calls, file writes).
+            # `claude` maintains session context for `claude -c` continuation.
+            shell_body = (
+                f"claude"
+                f" --model {shlex.quote(model)}"
+                f" --effort {shlex.quote(effort)}"
+                f" --allowedTools {shlex.quote(allowed_tools)}"
+                f' "$(cat {shlex.quote(prompt_path)})"'
             )
-            if not raw.strip():
-                return "", exit_code, 0.0, 0, 0
-            result_text, exit_hint, cost_usd, in_tok, out_tok = self._parse_claude_json(raw)
-            if exit_hint == -1:
-                return raw, exit_code, 0.0, 0, 0
-            return result_text, exit_code, cost_usd, in_tok, out_tok
+            _, exit_code = self._open_terminal(
+                title=f"Claude Code — {model} ({effort})",
+                shell_body=shell_body,
+                cwd=str(self.project_dir),
+                timeout=timeout,
+            )
+            # Cost: estimate from prompt length (no JSON capture in interactive mode)
+            cost_usd, in_tok, out_tok = self._estimate_cost_from_text(prompt, "", model)
+            return "Interactive session completed", exit_code, cost_usd, in_tok, out_tok
 
         # --- Background mode (piped subprocess) ---
         proc = subprocess.Popen(
@@ -688,13 +676,15 @@ echo "$_EXIT" > {shlex.quote(done_path)}
         cmd_display = cmd[:-1] + [f"'({len(prompt)} chars)'"]
         print(f"  $ {' '.join(cmd_display)}  (timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode (macOS) ---
+        # --- Visible Terminal mode: interactive opencode ---
         if self.visible_terminal:
-            output, exit_code = self._run_in_terminal(
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
+            output, exit_code = self._open_terminal(
                 title=f"OpenCode — {model} ({effort})",
-                cmd=cmd,
-                timeout=timeout,
+                shell_body=cmd_str,
                 cwd=str(self.project_dir),
+                timeout=timeout,
+                expected_files=expected_files,
                 cancel_event=cancel_event,
             )
             if not output.strip() and expected_files:
@@ -858,22 +848,37 @@ echo "$_EXIT" > {shlex.quote(done_path)}
 
         start = time.time()
 
-        # --- Visible Terminal mode: run codex exec in Terminal.app ---
+        # --- Visible Terminal mode: run codex in Terminal.app ---
         if self.visible_terminal:
-            prompt = build_review_prompt(
+            tmpdir = tempfile.mkdtemp(prefix="ra-terminal-")
+            review_prompt = build_review_prompt(
                 task.stage.value, "\n\n".join(context_parts), criteria, task.instruction)
-            cmd = ["codex", "exec"]
+            prompt_path = os.path.join(tmpdir, "review_prompt.txt")
+            output_path = os.path.join(tmpdir, "review_output.txt")
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(review_prompt)
+            # Codex doesn't have interactive TUI — use exec with tee for visibility
+            codex_cmd = "codex exec"
             if codex_model:
-                cmd.extend(["--model", codex_model])
+                codex_cmd += f" --model {shlex.quote(codex_model)}"
             if codex_effort and codex_effort != "none":
-                cmd.extend(["-c", f'reasoning_effort="{codex_effort}"'])
-            cmd.append(prompt)
-            raw_output, exit_code = self._run_in_terminal(
-                title=f"Codex Critic — {codex_model} ({codex_effort})",
-                cmd=cmd,
-                timeout=900,
-                cwd=str(self.project_dir),
+                codex_cmd += f' -c \'reasoning_effort="{codex_effort}"\''
+            shell_body = (
+                f'{codex_cmd} "$(cat {shlex.quote(prompt_path)})"'
+                f" 2>&1 | tee {shlex.quote(output_path)}"
             )
+            _, exit_code = self._open_terminal(
+                title=f"Codex Critic — {codex_model} ({codex_effort})",
+                shell_body=shell_body,
+                cwd=str(self.project_dir),
+                timeout=900,
+            )
+            raw_output = ""
+            if os.path.exists(output_path):
+                try:
+                    raw_output = open(output_path, encoding="utf-8").read()
+                except Exception:
+                    pass
             result = parse_codex_review(raw_output)
             result.exit_code = exit_code
         else:
