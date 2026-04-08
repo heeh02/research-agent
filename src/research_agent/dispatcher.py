@@ -579,7 +579,7 @@ echo ""
                 self._kill_terminal_process(pid_path)
                 break
             if os.path.exists(done_path):
-                time.sleep(1)  # let script/tee flush final bytes
+                time.sleep(1)  # let tee flush final bytes
                 break
             time.sleep(3)
 
@@ -638,12 +638,11 @@ echo ""
         timeout = 900 if effort == "max" else 600
         print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode: claude -p with tee for real-time display ---
-        # NOTE: `script -q` + interactive `claude "prompt"` does NOT work —
-        # script's PTY layer swallows the positional prompt argument.
-        # Instead we use `claude -p` (piped mode) with `tee` so the user
-        # sees Claude's text output streaming in real-time, and we capture
-        # the JSON result for cost tracking + artifact detection.
+        # --- Visible Terminal mode ---
+        # Two-phase approach:
+        #   Phase 1: `claude -p` runs the task (reliable prompt + JSON capture)
+        #   Phase 2: `claude --resume <session_id>` opens interactive TUI
+        #            so the user can watch the conversation and continue
         if self.visible_terminal:
             if len(prompt.encode("utf-8")) > 200_000:
                 print("  ⚠ Prompt too large for visible terminal mode, falling back to piped mode")
@@ -654,6 +653,8 @@ echo ""
                 with open(prompt_path, "w", encoding="utf-8") as f:
                     f.write(prompt)
 
+                # Phase 1: claude -p executes the task, captures JSON
+                # Phase 2: claude --resume opens interactive TUI for observation
                 shell_body = (
                     f"cat {shlex.quote(prompt_path)}"
                     f" | claude -p"
@@ -661,7 +662,15 @@ echo ""
                     f" --model {shlex.quote(model)}"
                     f" --effort {shlex.quote(effort)}"
                     f" --allowedTools {shlex.quote(allowed_tools)}"
-                    f" 2>&1 | tee {shlex.quote(output_path)}"
+                    f" > {shlex.quote(output_path)} 2>&1"
+                    f"\n"
+                    f'\nSESSION_ID=$(python3 -c "import json,sys;d=json.load(open(\'{output_path}\'));print(d.get(\'session_id\',\'\'))" 2>/dev/null)'
+                    f"\nif [ -n \"$SESSION_ID\" ]; then"
+                    f"\n  echo ''"
+                    f"\n  echo '  Task complete. Opening interactive session...'"
+                    f"\n  echo ''"
+                    f"\n  claude --resume \"$SESSION_ID\" --model {shlex.quote(model)} --effort {shlex.quote(effort)}"
+                    f"\nfi"
                 )
                 output, exit_code = self._open_terminal(
                     title=f"Claude Code — {model} ({effort})",
