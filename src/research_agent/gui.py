@@ -209,6 +209,9 @@ class PipelineRunner:
                 except Exception:
                     pass
             self.log("  Force-killed running agent process.")
+        # Also kill visible terminal process if any
+        if d and hasattr(d, '_terminal_pid_file') and d._terminal_pid_file:
+            d._kill_terminal_process(d._terminal_pid_file)
 
     def _start_thread(self, mode, target, *args):
         self.running = True

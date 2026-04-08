@@ -6,13 +6,19 @@ Three CLI backends:
   - opencode: OpenCode CLI (`opencode run`) — supports Doubao, DeepSeek, Kimi, etc.
 
 Each agent runs as an independent subprocess with role-specific prompt and tools.
+
+On macOS, agents can optionally run in visible Terminal.app windows so the user
+can watch each CLI tool in real-time.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import platform
+import shlex
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -193,6 +199,12 @@ class MultiAgentDispatcher:
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ORCHESTRATOR]),
         }
         self._active_proc = None  # Track running subprocess for force-kill
+        self._terminal_pid_file: str | None = None  # PID file for visible terminal process
+        # Open CLI tools in visible Terminal.app windows (macOS only)
+        self.visible_terminal: bool = (
+            self.config.get("gui", {}).get("visible_terminal", True)
+            and platform.system() == "Darwin"
+        )
         self.max_turns: dict[AgentRole, int] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ENGINEER]),
@@ -453,6 +465,131 @@ class MultiAgentDispatcher:
             AgentRole.ORCHESTRATOR: AgentToolset.ORCHESTRATOR.value,
         }.get(role, AgentToolset.ENGINEER.value)
 
+    # -----------------------------------------------------------------------
+    # Visible Terminal — open CLI tool in a macOS Terminal.app window
+    # -----------------------------------------------------------------------
+
+    def _run_in_terminal(
+        self,
+        title: str,
+        cmd: list[str],
+        stdin_text: str | None = None,
+        timeout: int = 600,
+        cwd: str | None = None,
+        cancel_event=None,
+    ) -> tuple[str, int]:
+        """Run a command in a visible macOS Terminal.app window.
+
+        The user sees the CLI tool running in real-time.  Output is also
+        captured to a file so the dispatcher can parse it afterwards.
+
+        Returns (output_text, exit_code).
+        """
+        tmpdir = tempfile.mkdtemp(prefix="ra-terminal-")
+        output_path = os.path.join(tmpdir, "output.txt")
+        done_path = os.path.join(tmpdir, "done.txt")
+        pid_path = os.path.join(tmpdir, "pid.txt")
+        self._terminal_pid_file = pid_path
+
+        cmd_str = " ".join(shlex.quote(c) for c in cmd)
+
+        # Build stdin redirect if prompt is provided
+        if stdin_text:
+            prompt_path = os.path.join(tmpdir, "prompt.txt")
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(stdin_text)
+            pipe_in = f"cat {shlex.quote(prompt_path)} | "
+            # PIPESTATUS[1] = exit code of the second command in the pipe
+            exit_var = "${PIPESTATUS[1]}"
+        else:
+            pipe_in = ""
+            exit_var = "${PIPESTATUS[0]}"
+
+        cd_line = f"cd {shlex.quote(cwd)}" if cwd else ""
+        # Escape the command for display inside a bash echo (replace ' with '"'"')
+        cmd_display = cmd_str.replace("'", "'\"'\"'")
+
+        script = f"""#!/bin/bash
+{cd_line}
+echo $$ > {shlex.quote(pid_path)}
+printf '\\033[1;36m'
+echo "╔══════════════════════════════════════════════════════╗"
+printf '║  %-52s  ║\\n' "{title}"
+echo "╚══════════════════════════════════════════════════════╝"
+printf '\\033[0m'
+echo ""
+echo "\\033[2m\\$ {cmd_display} \\033[0m"
+echo ""
+{pipe_in}{cmd_str} 2>&1 | tee {shlex.quote(output_path)}
+_EXIT={exit_var}
+echo ""
+if [ "$_EXIT" = "0" ]; then
+  printf '\\033[1;32m════ Done (exit 0) ════\\033[0m\\n'
+else
+  printf '\\033[1;31m════ Failed (exit %s) ════\\033[0m\\n' "$_EXIT"
+fi
+echo "$_EXIT" > {shlex.quote(done_path)}
+# Keep window open so user can read the output
+exec bash
+"""
+        script_path = os.path.join(tmpdir, "run.sh")
+        with open(script_path, "w") as f:
+            f.write(script)
+        os.chmod(script_path, 0o755)
+
+        # Open in Terminal.app — creates a new window/tab
+        osa_script = (
+            'tell application "Terminal"\n'
+            "  activate\n"
+            f'  do script "{script_path}"\n'
+            "end tell"
+        )
+        subprocess.run(["osascript", "-e", osa_script], capture_output=True)
+        print(f"  [Terminal.app] Opened: {title}", flush=True)
+
+        # Poll for done marker
+        start_t = time.time()
+        while time.time() - start_t < timeout:
+            if cancel_event and cancel_event.is_set():
+                self._kill_terminal_process(pid_path)
+                break
+            if os.path.exists(done_path):
+                break
+            time.sleep(3)
+
+        self._terminal_pid_file = None
+
+        # Read results
+        output = ""
+        if os.path.exists(output_path):
+            try:
+                output = open(output_path, encoding="utf-8", errors="replace").read()
+            except Exception:
+                pass
+
+        exit_code = 124  # default: timeout
+        if os.path.exists(done_path):
+            try:
+                exit_code = int(open(done_path).read().strip())
+            except (ValueError, OSError):
+                exit_code = 1
+
+        return output, exit_code
+
+    def _kill_terminal_process(self, pid_path: str):
+        """Kill the process running in a Terminal.app window."""
+        if not os.path.exists(pid_path):
+            return
+        try:
+            pid = int(open(pid_path).read().strip())
+            os.killpg(os.getpgid(pid), 9)
+        except (ProcessLookupError, PermissionError, ValueError, OSError):
+            pass
+
+    # -----------------------------------------------------------------------
+    # Internal — Claude Code CLI
+    # -----------------------------------------------------------------------
+
     def _run_claude(self, prompt: str, allowed_tools: str, model: str,
                     effort: str = "high") -> tuple[str, int, float, int, int]:
         """Run Claude Code CLI. Returns (output, exit_code, cost_usd, in_tokens, out_tokens)."""
@@ -465,7 +602,24 @@ class MultiAgentDispatcher:
         ]
         timeout = 900 if effort == "max" else 600
         print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
-        # Use Popen (not run) so the process can be force-killed by stop()
+
+        # --- Visible Terminal mode (macOS) ---
+        if self.visible_terminal:
+            raw, exit_code = self._run_in_terminal(
+                title=f"Claude Code — {model} ({effort})",
+                cmd=cmd,
+                stdin_text=prompt,
+                timeout=timeout,
+                cwd=str(self.project_dir),
+            )
+            if not raw.strip():
+                return "", exit_code, 0.0, 0, 0
+            result_text, exit_hint, cost_usd, in_tok, out_tok = self._parse_claude_json(raw)
+            if exit_hint == -1:
+                return raw, exit_code, 0.0, 0, 0
+            return result_text, exit_code, cost_usd, in_tok, out_tok
+
+        # --- Background mode (piped subprocess) ---
         proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -497,7 +651,6 @@ class MultiAgentDispatcher:
         if exit_hint == -1:
             return raw, proc.returncode, 0.0, 0, 0
 
-        # Use proc.returncode as authoritative; exit_hint is only a fallback
         exit_code = proc.returncode
         return result_text, exit_code, cost_usd, in_tok, out_tok
 
@@ -537,6 +690,22 @@ class MultiAgentDispatcher:
         cmd_display = cmd[:-1] + [f"'({len(prompt)} chars)'"]
         print(f"  $ {' '.join(cmd_display)}  (timeout {timeout}s)", flush=True)
 
+        # --- Visible Terminal mode (macOS) ---
+        if self.visible_terminal:
+            output, exit_code = self._run_in_terminal(
+                title=f"OpenCode — {model} ({effort})",
+                cmd=cmd,
+                timeout=timeout,
+                cwd=str(self.project_dir),
+                cancel_event=cancel_event,
+            )
+            if not output.strip() and expected_files:
+                found = [(self.project_dir / f).exists() for f in expected_files]
+                if all(found):
+                    output = f"Files produced: {expected_files}"
+            return output, exit_code
+
+        # --- Background mode (piped subprocess with poll loop) ---
         # Monitor opencode's tool-output directory for activity
         tool_dir = Path.home() / ".local" / "share" / "opencode" / "tool-output"
         tool_baseline = set(tool_dir.glob("*")) if tool_dir.exists() else set()
@@ -675,7 +844,7 @@ class MultiAgentDispatcher:
         )
 
     def _dispatch_codex(self, task: TaskCard) -> AgentResult:
-        from .integrations.codex import codex_review
+        from .integrations.codex import codex_review, build_review_prompt, parse_codex_review
         from .agents.critic import STAGE_REVIEW_CRITERIA
 
         context_parts = []
@@ -686,17 +855,40 @@ class MultiAgentDispatcher:
                 context_parts.append(self._yaml_to_readable(p.name, raw))
 
         criteria = STAGE_REVIEW_CRITERIA.get(task.stage.value, "Review for rigor.")
+        codex_model = self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4")
+        codex_effort = self.config.get("agents", {}).get("critic", {}).get("effort", "xhigh")
 
         start = time.time()
-        result = codex_review(
-            stage=task.stage.value,
-            artifact_content="\n\n".join(context_parts),
-            review_criteria=criteria,
-            project_context=task.instruction,
-            model=self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4"),
-            effort=self.config.get("agents", {}).get("critic", {}).get("effort", "xhigh"),
-            project_dir=self.project_dir,
-        )
+
+        # --- Visible Terminal mode: run codex exec in Terminal.app ---
+        if self.visible_terminal:
+            prompt = build_review_prompt(
+                task.stage.value, "\n\n".join(context_parts), criteria, task.instruction)
+            cmd = ["codex", "exec"]
+            if codex_model:
+                cmd.extend(["--model", codex_model])
+            if codex_effort and codex_effort != "none":
+                cmd.extend(["-c", f'reasoning_effort="{codex_effort}"'])
+            cmd.append(prompt)
+            raw_output, exit_code = self._run_in_terminal(
+                title=f"Codex Critic — {codex_model} ({codex_effort})",
+                cmd=cmd,
+                timeout=900,
+                cwd=str(self.project_dir),
+            )
+            result = parse_codex_review(raw_output)
+            result.exit_code = exit_code
+        else:
+            result = codex_review(
+                stage=task.stage.value,
+                artifact_content="\n\n".join(context_parts),
+                review_criteria=criteria,
+                project_context=task.instruction,
+                model=codex_model,
+                effort=codex_effort,
+                project_dir=self.project_dir,
+            )
+
         duration = time.time() - start
 
         pid = task.metadata.get("project_id", "default")
