@@ -11,6 +11,7 @@ from research_agent.artifacts import (
     create_artifact,
     load_schema,
     register_artifact_file,
+    safe_parse_yaml,
     validate_artifact_content,
 )
 from research_agent.models import (
@@ -461,3 +462,62 @@ class TestRealSchemaRegressions:
         content = yaml.dump({"metrics_summary": [{"name": "accuracy"}]})
         errors = validate_artifact_content(content, schema)
         assert any("'current'" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# safe_parse_yaml — front matter tolerance
+# ---------------------------------------------------------------------------
+
+class TestSafeParseYaml:
+    def test_normal_yaml(self):
+        assert safe_parse_yaml("key: value") == {"key": "value"}
+
+    def test_front_matter_stripped(self):
+        content = "---\n# comment\n---\nkey: value\n"
+        result = safe_parse_yaml(content)
+        assert result == {"key": "value"}
+
+    def test_front_matter_with_metadata(self):
+        content = (
+            "---\n"
+            "# Problem Brief v1\n"
+            "# Stage: problem_definition\n"
+            "---\n"
+            "domain: AI\n"
+            "problem_statement: test\n"
+        )
+        result = safe_parse_yaml(content)
+        assert result["domain"] == "AI"
+        assert result["problem_statement"] == "test"
+
+    def test_single_document_separator_ok(self):
+        content = "---\nkey: value\n"
+        result = safe_parse_yaml(content)
+        assert result == {"key": "value"}
+
+    def test_empty_content(self):
+        assert safe_parse_yaml("") is None
+
+    def test_invalid_yaml_still_raises(self):
+        with pytest.raises(yaml.YAMLError):
+            safe_parse_yaml("{invalid yaml{{")
+
+    def test_validation_with_front_matter(self):
+        """validate_artifact_content should accept YAML with front matter."""
+        schema = {"required_fields": ["domain", "problem_statement"]}
+        content = (
+            "---\n"
+            "# metadata block\n"
+            "---\n"
+            "domain: AI\n"
+            "problem_statement: Does X cause Y?\n"
+        )
+        errors = validate_artifact_content(content, schema)
+        assert errors == []
+
+    def test_validation_rejects_missing_field_with_front_matter(self):
+        """Front matter tolerance doesn't bypass schema validation."""
+        schema = {"required_fields": ["domain", "problem_statement"]}
+        content = "---\n# comment\n---\ndomain: AI\n"
+        errors = validate_artifact_content(content, schema)
+        assert any("problem_statement" in e for e in errors)

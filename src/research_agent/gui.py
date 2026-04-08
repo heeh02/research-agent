@@ -317,7 +317,7 @@ class PipelineRunner:
         registered_types: set[ArtifactType] = set()
         accepted_files: list[str] = []
 
-        from .artifacts import load_schema, validate_artifact_content, register_artifact_file
+        from .artifacts import load_schema, validate_artifact_content, register_artifact_file, safe_parse_yaml
         for p in result.output_files:
             for at in ArtifactType:
                 if at.value in Path(p).stem:
@@ -335,7 +335,7 @@ class PipelineRunner:
 
                     try:
                         raw = actual.read_text(encoding="utf-8")
-                        yaml.safe_load(raw)
+                        safe_parse_yaml(raw)
                     except yaml.YAMLError as e:
                         self.log(f"  REJECT: {at.value} — invalid YAML: {e}")
                         break

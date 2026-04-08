@@ -14,6 +14,8 @@ from typing import Optional
 
 import yaml
 
+from .artifacts import safe_parse_yaml
+
 from .models import (
     ArtifactType,
     AgentRole,
@@ -77,7 +79,7 @@ def _check_literature(
         if art.artifact_type != ArtifactType.LITERATURE_MAP:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             papers = (content or {}).get("papers", [])
 
             # Check URL presence
@@ -144,7 +146,7 @@ def _check_implementation(
         if art.artifact_type != ArtifactType.TEST_RESULT:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             overall = str((content or {}).get("overall_status", "")).lower()
             verified = (content or {}).get("verified_by") == "orchestrator"
 
@@ -186,7 +188,7 @@ def _check_experimentation(
         if art.artifact_type != ArtifactType.RUN_MANIFEST:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             smoke_cmd = (content or {}).get("smoke_test_command", "")
             if smoke_cmd:
                 # Extract script path from command like "python experiments/foo.py"
@@ -208,7 +210,7 @@ def _check_experimentation(
         if art.artifact_type != ArtifactType.METRICS:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             verified = (content or {}).get("verified_by") == "orchestrator"
             metrics = (content or {}).get("metrics_summary", [])
 
@@ -240,7 +242,7 @@ def _check_experimentation(
         if art.artifact_type != ArtifactType.METRICS:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             metrics = (content or {}).get("metrics_summary", [])
             if metrics:
                 all_just_pass = all(
@@ -287,7 +289,7 @@ def _check_analysis(
         if art.artifact_type != ArtifactType.CLAIM_CHECKLIST:
             continue
         try:
-            content = yaml.safe_load(sm.read_artifact_file(pid, art))
+            content = safe_parse_yaml(sm.read_artifact_file(pid, art))
             overall = (content or {}).get("overall_status", {})
             pct = overall.get("completion_percentage", "100%")
             if isinstance(pct, str):
@@ -315,7 +317,7 @@ def get_completion_percentage(
     for art in reversed(state.artifacts):
         if art.artifact_type == ArtifactType.CLAIM_CHECKLIST:
             try:
-                content = yaml.safe_load(sm.read_artifact_file(pid, art))
+                content = safe_parse_yaml(sm.read_artifact_file(pid, art))
                 overall = (content or {}).get("overall_status", {})
                 pct = overall.get("completion_percentage", "100%")
                 if isinstance(pct, str):

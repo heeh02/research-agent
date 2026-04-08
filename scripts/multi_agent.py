@@ -46,7 +46,7 @@ from research_agent.models import (
     VersionEventType,
 )
 from research_agent.state import StateManager
-from research_agent.artifacts import create_artifact, register_artifact_file, load_schema, validate_artifact_content
+from research_agent.artifacts import create_artifact, register_artifact_file, load_schema, validate_artifact_content, safe_parse_yaml
 from research_agent.dispatcher import MultiAgentDispatcher, TaskCard, AgentResult
 from research_agent.verdict import (
     evaluate_rollback,
@@ -279,7 +279,7 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
 
                 try:
                     raw = actual.read_text(encoding="utf-8")
-                    yaml.safe_load(raw)
+                    safe_parse_yaml(raw)
                 except yaml.YAMLError as e:
                     print(f"  REJECT: {atype.value} — invalid YAML: {e}")
                     break

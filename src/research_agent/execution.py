@@ -17,7 +17,7 @@ import yaml
 
 from .models import AgentRole, ArtifactType, ProjectState, Stage
 from .state import StateManager
-from .artifacts import register_artifact_file
+from .artifacts import register_artifact_file, safe_parse_yaml
 
 
 LogFn = Callable[[str], None]
@@ -84,7 +84,7 @@ def materialize_code(
             continue
         try:
             content = sm.read_artifact_file(project_id, art)
-            data = yaml.safe_load(content)
+            data = safe_parse_yaml(content)
             for file_entry in (data or {}).get("files", []):
                 rel_path = file_entry.get("path", "")
                 code_content = file_entry.get("content", "")
@@ -131,7 +131,7 @@ def execute_experiment(
 
     try:
         raw = sm.read_artifact_file(project_id, manifest_art)
-        manifest = yaml.safe_load(raw) or {}
+        manifest = safe_parse_yaml(raw) or {}
     except Exception as e:
         log(f"  Failed to read run_manifest: {e}")
         return None, -1
@@ -364,7 +364,7 @@ def run_and_record_experiment(
     if manifest_art:
         try:
             manifest_raw = sm.read_artifact_file(project_id, manifest_art)
-            manifest_data = yaml.safe_load(manifest_raw) or {}
+            manifest_data = safe_parse_yaml(manifest_raw) or {}
             for expected_file in manifest_data.get("expected_outputs", []):
                 fpath = proj_dir / expected_file
                 if fpath.exists() and fpath.stat().st_size < 1_000_000:

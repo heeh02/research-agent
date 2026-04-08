@@ -390,7 +390,8 @@ def cmd_repair(args):
         # Check 2: valid YAML
         try:
             raw = art_path.read_text(encoding="utf-8")
-            yaml.safe_load(raw)
+            from research_agent.artifacts import safe_parse_yaml
+            safe_parse_yaml(raw)
         except Exception as e:
             print(f"  REMOVE: {art.name} — invalid YAML: {e}")
             removed += 1

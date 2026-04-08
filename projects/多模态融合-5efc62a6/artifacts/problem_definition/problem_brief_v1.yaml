@@ -1,0 +1,345 @@
+# Problem Brief v1 — Emotion-Aware Multimodal Large Language Models
+# Stage: problem_definition | Iteration: 1
+# Project: 多模态融合
+# Generated: 2026-04-08
+
+domain: "Multimodal Affective Computing x Large Language Models"
+
+problem_statement: >
+  Current multimodal large language models (MLLMs) excel at visual-language understanding
+  but lack fine-grained, explainable, and temporally-aware emotion perception. They cannot
+  reliably detect a user's affective state from the interplay of facial micro-expressions,
+  vocal prosody, and conversational context. The core problem is: how to endow MLLMs with
+  continuous, cue-level emotion perception and cross-modal conflict reasoning so that they
+  genuinely understand the user's real-time emotional state — rather than producing shallow
+  categorical labels or ignoring emotional signals entirely.
+
+motivation: >
+  (1) Human-computer interaction is shifting from task-oriented to empathetic — future AI
+  assistants must sense user frustration, confusion, or excitement to respond appropriately.
+  (2) Existing emotion recognition models treat the task as closed-set classification with
+  fixed taxonomies (e.g., Ekman's 6 basic emotions), losing the nuance of real-world affect.
+  (3) MLLMs offer a unified architecture for multi-modal input and open-vocabulary output,
+  but their emotion understanding remains superficial — EmoLLM benchmark shows average MLLMs
+  score only ~50% on fine-grained emotion tasks, and GPT-4V cannot process audio or detect
+  micro-expressions. (4) The MER2025 challenge (132K samples, 4 tracks) explicitly calls
+  for LLM-driven generative emotion understanding, signaling community readiness for a
+  paradigm shift from discriminative to generative affective computing. (5) Top venues are
+  actively publishing: Emotion-LLaMA (NeurIPS 2024), EmoLLMs (KDD 2024), AffectGPT
+  (ICML 2025), Emotion-Qwen-VL (ACM MM 2025), confirming strong venue receptivity.
+
+scope:
+  in_scope:
+    - Multimodal (video + audio + text) emotion recognition via MLLMs
+    - Open-vocabulary and fine-grained emotion understanding (beyond basic 6-7 categories)
+    - Explainable emotion reasoning with cue-level evidence (facial, vocal, contextual)
+    - Continuous/dynamic user state tracking across multi-turn interactions
+    - Cross-modal emotion conflict detection and resolution (e.g., sarcasm, masked emotions)
+    - Benchmark evaluation on MER-UniBench, EmoBench, MMEVerse-Bench, DFEW
+  out_of_scope:
+    - Unimodal-only emotion recognition (text-only or audio-only)
+    - Physiological signal-based recognition (EEG, ECG, GSR) — sensor dependency limits deployment
+    - Emotion generation / affective dialogue response synthesis (separate direction)
+    - Clinical psychiatric diagnosis applications
+
+existing_approaches:
+  - name: "Emotion-LLaMA"
+    description: >
+      Integrates audio (HuBERT), visual (MAE+VideoMAE+EVA multiview), and text into
+      LLaMA2-chat (7B) via instruction tuning with LoRA. Introduces MERR dataset
+      (28,618 coarse + 4,487 fine-grained samples). Achieves F1=0.9036 on MER2023-SEMI,
+      Clue Overlap 7.83 on EMER, and won MER2024 MER-Noise track. Key innovation:
+      multiview visual projection capturing facial details, dynamics, and context.
+    key_paper:
+      title: "Emotion-LLaMA: Multimodal Emotion Recognition and Reasoning with Instruction Tuning"
+      authors: "Zebang Cheng, Zhi-Qi Cheng, Jun-Yan He, Jingdong Sun, Kai Wang, Yuxiang Lin, et al."
+      year: 2024
+      venue: "NeurIPS 2024"
+      url: "https://arxiv.org/abs/2406.11161"
+      verified: true
+
+  - name: "AffectGPT"
+    description: >
+      Constructs MER-Caption, the largest descriptive emotion dataset (115K samples, 2K+
+      fine-grained emotion categories) via model-based crowd-sourcing. Introduces pre-fusion
+      operations for enhanced multimodal integration, MER-UniBench for unified evaluation
+      across categorical and free-form emotion outputs, achieving 9%+ improvement over
+      existing MLLMs.
+    key_paper:
+      title: "AffectGPT: A New Dataset, Model, and Benchmark for Emotion Understanding with MLLMs"
+      authors: "Zheng Lian, Licai Sun, Haiyang Sun, Ke Xu, Zhuofan Wen, Bin Liu, Jianhua Tao, et al."
+      year: 2025
+      venue: "arXiv preprint"
+      url: "https://arxiv.org/abs/2501.16566"
+      verified: true
+
+  - name: "EmoLLM (Multimodal)"
+    description: >
+      Introduces EmoBench, the first comprehensive benchmark evaluating emotional
+      capabilities of MLLMs across 5 tasks using 287K images/videos with textual
+      instructions. Multi-perspective Visual Projection captures diverse emotional cues;
+      EmoPrompt guides MLLMs toward correct emotion reasoning. Average 12.1% improvement
+      across multiple foundation models on EmoBench.
+    key_paper:
+      title: "EmoLLM: Multimodal Emotional Understanding Meets Large Language Models"
+      authors: "Qu Yang, Mang Ye, et al."
+      year: 2024
+      venue: "arXiv preprint"
+      url: "https://arxiv.org/abs/2406.16442"
+      verified: true
+
+  - name: "XEmoGPT"
+    description: >
+      Explainable emotion recognition with cue-level perception. Introduces Video Emotional
+      Cue Bridge (VECB) and Audio Emotional Cue Bridge (AECB) modules for fine-grained cue
+      detection. Provides EmoCue dataset and EmoCue-360 automated evaluation metric.
+      Addresses fundamental gap between global-structure encoders and fine-grained emotional
+      cue detection.
+    key_paper:
+      title: "XEmoGPT: An Explainable Multimodal Emotion Recognition Framework with Cue-Level Perception and Reasoning"
+      authors: "Zheng Lian, Licai Sun, Yong Ren, Haiyang Sun, et al."
+      year: 2026
+      venue: "arXiv preprint"
+      url: "https://arxiv.org/abs/2602.05496"
+      verified: true
+
+  - name: "Emotion-LLaMAv2 + MMEVerse"
+    description: >
+      End-to-end pipeline eliminating external face detection via multiview encoder.
+      Conv-Attention pre-fusion for local-global multimodal feature interaction.
+      Perception-to-cognition curriculum instruction tuning. MMEVerse aggregates 12
+      emotion datasets into unified format (130K clips). SOTA on MER-UniBench and
+      MMEVerse-Bench, outperforming Qwen2.5-Omni and AffectGPT.
+    key_paper:
+      title: "Emotion-LLaMAv2 and MMEVerse: A New Framework and Benchmark for Multimodal Emotion Understanding"
+      authors: "Zebang Cheng, Shihao Gao, Jialing Liu, et al."
+      year: 2026
+      venue: "arXiv preprint"
+      url: "https://arxiv.org/abs/2601.16449"
+      verified: true
+
+  - name: "Emotion-Qwen / Emotion-Qwen-VL"
+    description: >
+      Hybrid approach: Emotion-Qwen-VL fully fine-tunes Qwen2.5-VL for micro-expression
+      VQA (MEGC 2025 champion). Emotion-Qwen adds Facial Emotion Capture (FEC) module and
+      attention-aware MoE Hybrid Compressor to fuse emotion-specific and general-purpose
+      representations, preserving general VL capabilities while adding emotion expertise.
+    key_paper:
+      title: "Emotion-Qwen: Training Hybrid Experts for Unified Emotion and General Vision-Language Understanding"
+      authors: "Qu Yang, et al."
+      year: 2025
+      venue: "arXiv preprint"
+      url: "https://arxiv.org/abs/2505.06685"
+      verified: true
+
+  - name: "MER2025 Challenge Framework"
+    description: >
+      Third edition of MER challenge series (132K samples). Four tracks: MER-SEMI
+      (semi-supervised categorical), MER-FG (fine-grained), MER-DES (interpretable
+      descriptions beyond emotion words), MER-PR (emotion-personality relationships).
+      Explicitly shifts paradigm from categorical to LLM-driven generative methods.
+    key_paper:
+      title: "MER 2025: When Affective Computing Meets Large Language Models"
+      authors: "Zheng Lian, Licai Sun, Haiyang Sun, Ke Xu, Zhuofan Wen, et al."
+      year: 2025
+      venue: "arXiv / IJCAI-ACM MM Workshop"
+      url: "https://arxiv.org/html/2504.19423"
+      verified: true
+
+  - name: "EmoLLMs (Text-centric Series)"
+    description: >
+      Series of instruction-following LLMs for comprehensive affective analysis. AAID
+      dataset (234K samples) and AEB benchmark (14 tasks). Outperforms ChatGPT and GPT-4
+      on most affective analysis tasks, demonstrating instruction-tuned open-source LLMs
+      can surpass proprietary models in emotion understanding.
+    key_paper:
+      title: "EmoLLMs: A Series of Emotional Large Language Models and Annotation Tools for Comprehensive Affective Analysis"
+      authors: "Zhiwei Liu, Kailai Yang, Tianlin Zhang, Qianqian Xie, Zeping Yu, Sophia Ananiadou"
+      year: 2024
+      venue: "KDD 2024"
+      url: "https://arxiv.org/abs/2401.08508"
+      verified: true
+
+limitations_of_existing:
+  - limitation: "Shallow cross-modal fusion without conflict reasoning"
+    detail: >
+      Current approaches (Emotion-LLaMA, AffectGPT) align modalities via linear projection
+      or pre-fusion but do not capture cross-modal emotional interactions. They fail on
+      sarcasm (visual smile + negative vocal tone), masked emotions, and ambiguous cues.
+      True affective understanding requires reasoning over modality conflicts, not just
+      concatenation. Emotion-LLaMA's multiview projection captures diverse cues but does
+      not model their disagreements.
+
+  - limitation: "Static per-utterance recognition without temporal user state modeling"
+    detail: >
+      Nearly all methods perform per-clip emotion classification. None models the temporal
+      evolution of user emotional state across a conversation session. Real empathetic AI
+      requires tracking arousal/valence trajectories — how frustration builds, peaks, and
+      resolves over time. Personalization studies (ICMI 2024) show up to 38% accuracy gain
+      from user-specific modeling, but no current MLLM implements this.
+
+  - limitation: "Lack of cue-level explainability in most systems"
+    detail: >
+      Most MLLM-based emotion recognizers output labels without articulating WHY — which
+      micro-expression, vocal tremor, or contextual trigger drove the prediction. XEmoGPT
+      identifies this as a fundamental gap but is limited to video+audio cues. No system
+      provides end-to-end cue-grounded explanations across all modalities with verifiable
+      evidence linking.
+
+  - limitation: "Catastrophic forgetting of general MLLM capabilities"
+    detail: >
+      Fine-tuning on emotion data degrades general VL abilities. Emotion-Qwen's MoE
+      approach partially addresses this but adds significant computational overhead.
+      A principled, parameter-efficient solution (LoRA + selective routing) that preserves
+      general reasoning while gaining emotion expertise remains unsolved at scale.
+
+  - limitation: "Fragmented benchmarks with cultural and annotation bias"
+    detail: >
+      Datasets (IEMOCAP, MELD, DFEW, MAFW, MER-Caption) use incompatible annotation
+      schemes. Most are English/Chinese-centric with Western emotion taxonomies.
+      Open-vocabulary evaluation metrics (MER-DES) are immature. No single benchmark
+      evaluates the full pipeline from cue perception to emotion reasoning to temporal
+      state prediction.
+
+proposed_direction: >
+  **Temporal Cue-Grounded Affective Reasoning in MLLMs (TempAffect)**:
+  A framework that uniquely combines three currently separate research threads into a
+  unified MLLM architecture:
+
+  (1) Multi-granularity emotion encoders — extend XEmoGPT's cue-bridge approach with
+  modality-specific adapters that extract both global affect features and fine-grained
+  cues (micro-expressions via temporal difference frames, prosody contours via pitch/energy
+  extraction, linguistic sentiment via attention-highlighted tokens).
+
+  (2) Cross-modal emotion conflict reasoning — a contrastive alignment module that
+  explicitly detects when modalities disagree (e.g., sarcasm, social masking) and reasons
+  about the true underlying affect. This goes beyond AffectGPT's pre-fusion by modeling
+  conflict as a first-class signal rather than noise.
+
+  (3) Temporal emotion state tracker — a memory-augmented attention mechanism that
+  maintains a persistent user emotional state representation updated across conversation
+  turns. This is entirely unexplored in the MLLM-emotion context and addresses the
+  critical gap between per-clip recognition and session-level user understanding.
+
+  (4) Parameter-efficient adaptation — combine LoRA with MoE routing (building on
+  Emotion-Qwen's insight) to preserve general MLLM capabilities while adding emotion
+  expertise, targeting <2% degradation on general benchmarks.
+
+  Novelty: No existing work combines cue-level perception, cross-modal conflict
+  reasoning, AND temporal state tracking. Emotion-LLaMAv2 is closest but lacks (2)
+  and (3); XEmoGPT has (1) partially but lacks (2) and (3).
+
+  Target venues: NeurIPS 2027, ACL 2027, ACM Multimedia 2027 (main conference)
+
+success_criteria:
+  - metric: "MER-UniBench / MMEVerse-Bench overall accuracy"
+    target: "Surpass Emotion-LLaMAv2 by >= 2 absolute points"
+  - metric: "EMER Clue Overlap"
+    target: "> 8.5 (vs. Emotion-LLaMA's 7.83)"
+  - metric: "Cross-modal conflict detection F1"
+    target: ">= 75% on sarcasm/masked-emotion subsets"
+  - metric: "Temporal emotion tracking"
+    target: "New metric: emotion transition F1 >= 70% on multi-turn dialogue"
+  - metric: "General capability retention"
+    target: "< 2% degradation on MMBench/MME after emotion fine-tuning"
+  - metric: "User study"
+    target: ">= 15% improvement in interaction satisfaction with temporal tracking"
+  - metric: "Venue acceptance"
+    target: "Publication at NeurIPS/ACL/AAAI/ACM MM (CCF-A main conference)"
+
+key_references:
+  - title: "Emotion-LLaMA: Multimodal Emotion Recognition and Reasoning with Instruction Tuning"
+    authors: "Zebang Cheng, Zhi-Qi Cheng, Jun-Yan He, et al."
+    year: 2024
+    venue: "NeurIPS 2024"
+    url: "https://arxiv.org/abs/2406.11161"
+    relevance: "Foundation architecture for emotion-specific MLLM; NeurIPS baseline with MERR dataset"
+    verified: true
+
+  - title: "AffectGPT: A New Dataset, Model, and Benchmark for Emotion Understanding with MLLMs"
+    authors: "Zheng Lian, Licai Sun, Haiyang Sun, et al."
+    year: 2025
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2501.16566"
+    relevance: "Largest descriptive emotion dataset (115K); defines MER-UniBench evaluation standard"
+    verified: true
+
+  - title: "Emotion-LLaMAv2 and MMEVerse: A New Framework and Benchmark for Multimodal Emotion Understanding"
+    authors: "Zebang Cheng, Shihao Gao, Jialing Liu, et al."
+    year: 2026
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2601.16449"
+    relevance: "Current SOTA; end-to-end pipeline + unified 12-dataset benchmark — primary comparison target"
+    verified: true
+
+  - title: "XEmoGPT: An Explainable Multimodal Emotion Recognition Framework with Cue-Level Perception and Reasoning"
+    authors: "Zheng Lian, Licai Sun, Yong Ren, et al."
+    year: 2026
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2602.05496"
+    relevance: "Closest to our cue-level perception goal; identifies fine-grained cue detection gap"
+    verified: true
+
+  - title: "EmoLLM: Multimodal Emotional Understanding Meets Large Language Models"
+    authors: "Qu Yang, Mang Ye, et al."
+    year: 2024
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2406.16442"
+    relevance: "EmoBench benchmark (287K samples); quantifies MLLM emotion understanding gaps"
+    verified: true
+
+  - title: "Emotion-Qwen: Training Hybrid Experts for Unified Emotion and General Vision-Language Understanding"
+    authors: "Qu Yang, et al."
+    year: 2025
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2505.06685"
+    relevance: "MoE approach to preserving general capabilities — informs our parameter-efficient design"
+    verified: true
+
+  - title: "MER 2025: When Affective Computing Meets Large Language Models"
+    authors: "Zheng Lian, Licai Sun, Haiyang Sun, et al."
+    year: 2025
+    venue: "arXiv / IJCAI-ACM MM Workshop"
+    url: "https://arxiv.org/html/2504.19423"
+    relevance: "Defines challenge tracks (4 tracks, 132K samples); MER-DES directly relevant to explainability"
+    verified: true
+
+  - title: "EmoLLMs: A Series of Emotional Large Language Models and Annotation Tools for Comprehensive Affective Analysis"
+    authors: "Zhiwei Liu, Kailai Yang, Tianlin Zhang, et al."
+    year: 2024
+    venue: "KDD 2024"
+    url: "https://arxiv.org/abs/2401.08508"
+    relevance: "Demonstrates instruction-tuned open-source LLMs surpass GPT-4 on emotion tasks"
+    verified: true
+
+  - title: "Affective Computing in the Era of Large Language Models: A Survey from the NLP Perspective"
+    authors: "Yiqun Zhang, Xiaocui Yang, et al."
+    year: 2024
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2408.04638"
+    relevance: "Comprehensive survey of LLM x affective computing; maps instruction tuning and RLHF methods"
+    verified: true
+
+  - title: "Pioneering Multimodal Emotion Recognition in the Era of Large Models: From Closed Sets to Open Vocabularies"
+    authors: "Zheng Lian, et al."
+    year: 2025
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2512.20938"
+    relevance: "Benchmarks 19 MLLMs on open-vocabulary MER; reveals paradigm shift from closed to open sets"
+    verified: true
+
+  - title: "Multimodal Large Language Models Meet Multimodal Emotion Recognition and Reasoning: A Survey"
+    authors: "Multiple authors"
+    year: 2025
+    venue: "arXiv preprint"
+    url: "https://arxiv.org/abs/2509.24322"
+    relevance: "Most comprehensive survey at MLLM-MER intersection; taxonomizes approaches and benchmarks"
+    verified: true
+
+  - title: "On Multimodal Emotion Recognition for Human-Chatbot Interaction in the Wild"
+    authors: "Multiple authors"
+    year: 2024
+    venue: "ICMI 2024"
+    url: "https://dl.acm.org/doi/10.1145/3678957.3685759"
+    relevance: "Shows personalization improves emotion recognition by up to 38%; motivates temporal user modeling"
+    verified: true

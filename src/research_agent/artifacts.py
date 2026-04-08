@@ -11,9 +11,33 @@ from typing import Any
 
 import yaml
 
-from pathlib import Path
-
 from .models import AgentRole, Artifact, ArtifactType, ProjectState, Stage
+
+
+# ---------------------------------------------------------------------------
+# YAML parsing — handles front matter and multi-document streams
+# ---------------------------------------------------------------------------
+
+def safe_parse_yaml(content: str) -> Any:
+    """Parse YAML content, tolerating front matter ``---`` blocks.
+
+    LLM agents frequently emit YAML with Jekyll-style front matter::
+
+        ---
+        # Problem Brief v1
+        ---
+        domain: "..."
+
+    ``yaml.safe_load()`` treats each ``---`` as a document separator and
+    raises ``ComposerError``.  This helper tries the fast path first, then
+    falls back to ``safe_load_all()`` and returns the last non-None document.
+    """
+    try:
+        return yaml.safe_load(content)
+    except yaml.composer.ComposerError:
+        # Multi-document stream — take the last real document
+        docs = [d for d in yaml.safe_load_all(content) if d is not None]
+        return docs[-1] if docs else None
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +79,7 @@ def validate_artifact_content(content: str, schema: dict[str, Any]) -> list[str]
         return errors  # No schema = no validation
 
     try:
-        data = yaml.safe_load(content)
+        data = safe_parse_yaml(content)
     except yaml.YAMLError as e:
         return [f"Invalid YAML: {e}"]
 
