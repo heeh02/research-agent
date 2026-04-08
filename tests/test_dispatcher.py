@@ -1,6 +1,7 @@
 """Tests for research_agent.dispatcher — TaskCard, AgentResult, retry logic, prompt building."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -493,3 +494,107 @@ class TestAgentResultCostFields:
         assert r.input_tokens == 0
         assert r.output_tokens == 0
         assert r.cost_source == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Visible terminal sidecar protocol
+# ---------------------------------------------------------------------------
+
+class TestStripAnsi:
+    def test_strips_color_codes(self):
+        text = "\x1b[1;32mDone\x1b[0m (exit 0)"
+        assert MultiAgentDispatcher._strip_ansi(text) == "Done (exit 0)"
+
+    def test_preserves_plain_text(self):
+        assert MultiAgentDispatcher._strip_ansi("hello world") == "hello world"
+
+    def test_strips_cursor_movement(self):
+        text = "\x1b[2J\x1b[Hcontent"
+        assert MultiAgentDispatcher._strip_ansi(text) == "content"
+
+
+class TestSidecarProtocol:
+    """Tests for the sidecar file-based completion protocol.
+
+    These test the result-reading logic of _open_terminal by pre-creating
+    sidecar files (simulating what the wrapper script would write) and
+    mocking the osascript call so no real Terminal.app window opens.
+    """
+
+    @staticmethod
+    def _make_dispatcher(tmp_path):
+        d = MultiAgentDispatcher(tmp_path, tmp_path)
+        d.visible_terminal = False
+        return d
+
+    @staticmethod
+    def _mock_open_terminal(d, run_dir, sidecar_files, timeout=2):
+        """Call _open_terminal but mock osascript and pre-create sidecar files."""
+        import unittest.mock
+        # Pre-create sidecar files before the poll loop starts
+        for name, content in sidecar_files.items():
+            Path(run_dir).joinpath(name).write_text(content)
+        Path(run_dir).joinpath("pid.txt").write_text("99999")
+        with unittest.mock.patch("subprocess.run"):  # mock osascript
+            return d._open_terminal(
+                title="Test", shell_body="true",
+                run_dir=run_dir, timeout=timeout,
+            )
+
+    def test_exit_code_from_file(self, tmp_path):
+        """exit_code.txt is authoritative for exit code."""
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+        d = self._make_dispatcher(tmp_path)
+        output, exit_code = self._mock_open_terminal(d, run_dir, {
+            "done.txt": "", "exit_code.txt": "42", "output.txt": "some output",
+        })
+        assert exit_code == 42
+        assert output == "some output"
+
+    def test_done_without_exit_code(self, tmp_path):
+        """done.txt exists but exit_code.txt missing → exit_code = 1."""
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+        d = self._make_dispatcher(tmp_path)
+        _, exit_code = self._mock_open_terminal(d, run_dir, {
+            "done.txt": "",
+        })
+        assert exit_code == 1
+
+    def test_timeout_returns_124(self, tmp_path):
+        """No done.txt within timeout → exit_code = 124."""
+        import unittest.mock
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+        Path(run_dir, "pid.txt").write_text("99999")
+        d = self._make_dispatcher(tmp_path)
+        with unittest.mock.patch("subprocess.run"):
+            _, exit_code = d._open_terminal(
+                title="Test", shell_body="true",
+                run_dir=run_dir, timeout=1,
+            )
+        assert exit_code == 124
+
+    def test_ansi_stripped_from_output(self, tmp_path):
+        """output.txt with ANSI codes → returned output is clean."""
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+        d = self._make_dispatcher(tmp_path)
+        output, _ = self._mock_open_terminal(d, run_dir, {
+            "done.txt": "", "exit_code.txt": "0",
+            "output.txt": "\x1b[1;36mResult\x1b[0m here",
+        })
+        assert output == "Result here"
+        assert "\x1b" not in output
+
+    def test_empty_output_with_success(self, tmp_path):
+        """output.txt empty but exit 0 → success with empty string."""
+        run_dir = str(tmp_path / "run")
+        os.makedirs(run_dir)
+        d = self._make_dispatcher(tmp_path)
+        output, exit_code = self._mock_open_terminal(d, run_dir, {
+            "done.txt": "", "exit_code.txt": "0", "output.txt": "",
+        })
+        assert exit_code == 0
+        assert output == ""
