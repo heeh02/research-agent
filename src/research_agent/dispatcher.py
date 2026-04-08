@@ -50,9 +50,9 @@ class AgentToolset(str, Enum):
 
 
 DEFAULT_AGENT_MODELS: dict[AgentRole, str] = {
-    AgentRole.RESEARCHER: "claude-sonnet-4-6-20250514",
-    AgentRole.ENGINEER: "claude-sonnet-4-6-20250514",
-    AgentRole.ORCHESTRATOR: "claude-sonnet-4-6-20250514",
+    AgentRole.RESEARCHER: "claude-sonnet-4-6",
+    AgentRole.ENGINEER: "claude-sonnet-4-6",
+    AgentRole.ORCHESTRATOR: "claude-sonnet-4-6",
 }
 
 DEFAULT_AGENT_EFFORT: dict[AgentRole, str] = {
@@ -227,7 +227,7 @@ class MultiAgentDispatcher:
         # Claude and OpenCode share the same retry loop
         prompt = self._build_prompt(task)
         toolset = self._get_toolset(role)
-        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-6-20250514"))
+        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-6"))
         effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
 
         # Critic doesn't produce files — it outputs verdict in stdout
@@ -509,28 +509,26 @@ class MultiAgentDispatcher:
         # Escape the command for display inside a bash echo (replace ' with '"'"')
         cmd_display = cmd_str.replace("'", "'\"'\"'")
 
-        script = f"""#!/bin/bash
+        script = f"""#!/bin/zsh
 {cd_line}
 echo $$ > {shlex.quote(pid_path)}
-printf '\\033[1;36m'
+print -P '%F{{cyan}}'
 echo "╔══════════════════════════════════════════════════════╗"
 printf '║  %-52s  ║\\n' "{title}"
 echo "╚══════════════════════════════════════════════════════╝"
-printf '\\033[0m'
+print -P '%f'
 echo ""
-echo "\\033[2m\\$ {cmd_display} \\033[0m"
+print -P '%%F{{8}}$ {cmd_display}%%f'
 echo ""
 {pipe_in}{cmd_str} 2>&1 | tee {shlex.quote(output_path)}
-_EXIT={exit_var}
+_EXIT=${{pipestatus[{2 if stdin_text else 1}]}}
 echo ""
 if [ "$_EXIT" = "0" ]; then
-  printf '\\033[1;32m════ Done (exit 0) ════\\033[0m\\n'
+  print -P '%F{{green}}════ Done (exit 0) ════%f'
 else
-  printf '\\033[1;31m════ Failed (exit %s) ════\\033[0m\\n' "$_EXIT"
+  print -P "%F{{red}}════ Failed (exit $_EXIT) ════%f"
 fi
 echo "$_EXIT" > {shlex.quote(done_path)}
-# Keep window open so user can read the output
-exec bash
 """
         script_path = os.path.join(tmpdir, "run.sh")
         with open(script_path, "w") as f:

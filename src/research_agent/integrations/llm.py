@@ -14,9 +14,9 @@ from __future__ import annotations
 PRICING: dict[str, tuple[float, float]] = {
     # (input_per_1M, output_per_1M)
     # Claude
-    "claude-opus-4-20250514": (15.0, 75.0),
-    "claude-sonnet-4-20250514": (3.0, 15.0),
-    "claude-haiku-4-5-20251001": (0.80, 4.0),
+    "claude-opus-4-6": (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (0.80, 4.0),
     # OpenAI / Codex
     "gpt-5.4": (5.0, 20.0),
     "gpt-5.4-mini": (1.0, 4.0),

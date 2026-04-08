@@ -1095,7 +1095,7 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 let DATA=__DATA__,STAGES=__STAGES__,CFG=__CFG__,PROJECTS=__PROJECTS__,PID=__PID__,PIPE=__PIPE__;
 const OC_MODELS=__OC__,STAGE_NAMES=__STAGE_NAMES__;
 const BACKENDS=['claude','codex','opencode'];
-const MODELS={claude:['claude-sonnet-4-20250514','claude-opus-4-20250514','claude-haiku-4-5-20251001'],codex:['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],opencode:OC_MODELS};
+const MODELS={claude:['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5'],codex:['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],opencode:OC_MODELS};
 const EFFORTS={claude:['max','high','medium','low'],codex:['xhigh','high','medium','low'],opencode:['max','high','medium','low','minimal']};
 const ROLES=['researcher','engineer','critic','orchestrator'];
 const ICONS={agent_run:'\u25B6',gate_review:'\u25C6',gate_passed:'\u2713',gate_failed:'\u2717',stage_advance:'\u23E9',stage_rollback:'\u21A9',human_approve:'\uD83D\uDC64',human_reject:'\u270B',human_feedback:'\uD83D\uDCAC'};
