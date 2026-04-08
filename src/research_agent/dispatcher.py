@@ -50,9 +50,9 @@ class AgentToolset(str, Enum):
 
 
 DEFAULT_AGENT_MODELS: dict[AgentRole, str] = {
-    AgentRole.RESEARCHER: "claude-sonnet-4-20250514",
-    AgentRole.ENGINEER: "claude-sonnet-4-20250514",
-    AgentRole.ORCHESTRATOR: "claude-sonnet-4-20250514",
+    AgentRole.RESEARCHER: "claude-sonnet-4-6-20250514",
+    AgentRole.ENGINEER: "claude-sonnet-4-6-20250514",
+    AgentRole.ORCHESTRATOR: "claude-sonnet-4-6-20250514",
 }
 
 DEFAULT_AGENT_EFFORT: dict[AgentRole, str] = {
@@ -227,7 +227,7 @@ class MultiAgentDispatcher:
         # Claude and OpenCode share the same retry loop
         prompt = self._build_prompt(task)
         toolset = self._get_toolset(role)
-        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-20250514"))
+        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-6-20250514"))
         effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
 
         # Critic doesn't produce files — it outputs verdict in stdout

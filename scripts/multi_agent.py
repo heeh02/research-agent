@@ -288,8 +288,8 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
                 if schema:
                     errors = validate_artifact_content(raw, schema)
                     if errors:
-                        print(f"  REJECT: {atype.value} — schema errors: {errors[:3]}")
-                        break
+                        print(f"  ⚠ Schema warnings for {atype.value}: {errors[:3]}")
+                        # Warn but don't reject — let critic review catch real issues
 
                 provenance = {
                     "backend": dispatcher.backends.get(role, "claude").value

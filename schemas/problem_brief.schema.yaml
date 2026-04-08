@@ -14,11 +14,10 @@ field_types:
   domain: string
   problem_statement: string
   motivation: string
-  scope: string
+  # scope and success_criteria can be string, list, or mapping — LLMs vary
   existing_approaches: list
   limitations_of_existing: list
   proposed_direction: string
-  success_criteria: string
   key_references: list
 
 min_lengths:

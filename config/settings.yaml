@@ -216,7 +216,7 @@ agents:
     backend: opencode
     effort: high
     max_turns: 40
-    model: volcengine-plan/doubao-seed-2.0-code
+    model: volcengine-plan/doubao-seed-2.0-pro
   orchestrator:
     allowed_tools: Read,Write,Bash,Glob,Grep
     backend: opencode
@@ -228,7 +228,7 @@ agents:
     backend: claude
     effort: max
     max_turns: 30
-    model: claude-opus-4-20250514
+    model: claude-opus-4-6-20250514
 cost:
   codex_estimated_cost_per_review: 0.1
   hard_limit: 50.0

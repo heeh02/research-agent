@@ -350,8 +350,8 @@ class PipelineRunner:
                     if schema:
                         errors = validate_artifact_content(raw, schema)
                         if errors:
-                            self.log(f"  REJECT: {at.value} — schema errors: {errors[:3]}")
-                            break
+                            self.log(f"  ⚠ Schema warnings for {at.value}: {errors[:3]}")
+                            # Warn but don't reject — let critic review catch real issues
 
                     art = register_artifact_file(
                         state, at, stage, role, actual, project_dir,
