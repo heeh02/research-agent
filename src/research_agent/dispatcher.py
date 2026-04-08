@@ -638,9 +638,13 @@ echo ""
         timeout = 900 if effort == "max" else 600
         print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode: interactive Claude Code TUI ---
+        # --- Visible Terminal mode: claude -p with tee for real-time display ---
+        # NOTE: `script -q` + interactive `claude "prompt"` does NOT work —
+        # script's PTY layer swallows the positional prompt argument.
+        # Instead we use `claude -p` (piped mode) with `tee` so the user
+        # sees Claude's text output streaming in real-time, and we capture
+        # the JSON result for cost tracking + artifact detection.
         if self.visible_terminal:
-            # Safety: fail closed if prompt is absurdly large for argv
             if len(prompt.encode("utf-8")) > 200_000:
                 print("  ⚠ Prompt too large for visible terminal mode, falling back to piped mode")
             else:
@@ -650,15 +654,14 @@ echo ""
                 with open(prompt_path, "w", encoding="utf-8") as f:
                     f.write(prompt)
 
-                # Read prompt into a shell variable, then pass as CLI arg.
-                # `script -q` wraps claude so the TUI renders AND output is captured.
                 shell_body = (
-                    f'_P="$(cat {shlex.quote(prompt_path)})"\n'
-                    f"script -q {shlex.quote(output_path)} claude"
+                    f"cat {shlex.quote(prompt_path)}"
+                    f" | claude -p"
+                    f" --output-format json"
                     f" --model {shlex.quote(model)}"
                     f" --effort {shlex.quote(effort)}"
                     f" --allowedTools {shlex.quote(allowed_tools)}"
-                    f' "$_P"'
+                    f" 2>&1 | tee {shlex.quote(output_path)}"
                 )
                 output, exit_code = self._open_terminal(
                     title=f"Claude Code — {model} ({effort})",
@@ -667,6 +670,11 @@ echo ""
                     cwd=str(self.project_dir),
                     timeout=timeout,
                 )
+                # Parse JSON from captured output for real cost data
+                if output.strip():
+                    result_text, exit_hint, cost_usd, in_tok, out_tok = self._parse_claude_json(output)
+                    if exit_hint != -1:
+                        return result_text, exit_code, cost_usd, in_tok, out_tok
                 cost_usd, in_tok, out_tok = self._estimate_cost_from_text(
                     prompt, output, model)
                 return output, exit_code, cost_usd, in_tok, out_tok
