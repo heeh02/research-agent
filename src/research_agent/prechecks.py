@@ -22,6 +22,7 @@ from .models import (
     CLIBackend,
     ProjectState,
     Stage,
+    is_critic_role,
 )
 from .state import StateManager
 
@@ -344,6 +345,7 @@ def verify_backend_capabilities(
     backend: CLIBackend,
     role: AgentRole,
     stage: Stage,
+    allowed_tools: str = "",
 ) -> list[str]:
     """Check that the configured backend can do what the stage needs.
 
@@ -362,13 +364,18 @@ def verify_backend_capabilities(
             f"Literature citations may be from training data only (not verified)."
         )
 
-    # Critic should not use a backend that can write files
-    if role == AgentRole.CRITIC and backend != CLIBackend.CODEX:
-        warnings.append(
-            f"Critic uses {backend.value} which can write files. "
-            f"Critic may violate review-only constraint. "
-            f"Recommended: use codex backend for Critic."
-        )
+    # Critic with write-capable tools is a real isolation concern.
+    # But if allowed_tools is restricted to read-only, it's fine even on Claude.
+    if is_critic_role(role):
+        _WRITE_TOOLS = {"Write", "Edit", "Bash"}
+        tool_set = {t.strip() for t in allowed_tools.split(",")} if allowed_tools else set()
+        has_write_tools = bool(tool_set & _WRITE_TOOLS)
+        if has_write_tools:
+            warnings.append(
+                f"{role.value} has write-capable tools ({tool_set & _WRITE_TOOLS}). "
+                f"Critic may violate review-only constraint. "
+                f"Restrict allowed_tools to read-only (Read,Glob,Grep)."
+            )
 
     # Tool isolation only works with claude backend
     if backend != CLIBackend.CLAUDE and role in (

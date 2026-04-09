@@ -168,7 +168,11 @@ class CriticAgent:
 # Stage-specific review criteria (fed to Codex as part of the prompt)
 # ---------------------------------------------------------------------------
 
-STAGE_REVIEW_CRITERIA: dict[str, str] = {
+# ---------------------------------------------------------------------------
+# Split review criteria: research vs code
+# ---------------------------------------------------------------------------
+
+RESEARCH_REVIEW_CRITERIA: dict[str, str] = {
     "problem_definition": """\
 Review the problem_brief artifact against these criteria:
 1. clarity (0-1): Problem statement unambiguous?
@@ -195,6 +199,18 @@ Review the hypothesis_card artifact:
 5. risk_awareness (0-1): Key risks identified and mitigated?
 6. kill_criteria (0-1): Specific enough to act on?""",
 
+    "analysis": """\
+Review the result_report and claim_checklist:
+1. evidence_support (0-1): Results support claims?
+2. statistical_validity (0-1): Statistics correct?
+3. alternative_explanations (0-1): Confounds addressed?
+4. honest_reporting (0-1): Negative results included?
+5. reproducibility (0-1): Results reproducible?
+
+Ask: "Do results truly support the claim?" and "Is there a simpler counter-explanation?" """,
+}
+
+CODE_REVIEW_CRITERIA: dict[str, str] = {
     "experiment_design": """\
 Review the experiment_spec artifact:
 1. completeness (0-1): All variables, controls, metrics defined?
@@ -220,16 +236,12 @@ Review the run_manifest and metrics artifacts:
 3. reproducibility_check (0-1): Results reproducible across seeds?
 4. no_anomalies (0-1): No unexplained anomalies?
 5. resource_tracking (0-1): Compute usage logged?""",
+}
 
-    "analysis": """\
-Review the result_report and claim_checklist:
-1. evidence_support (0-1): Results support claims?
-2. statistical_validity (0-1): Statistics correct?
-3. alternative_explanations (0-1): Confounds addressed?
-4. honest_reporting (0-1): Negative results included?
-5. reproducibility (0-1): Results reproducible?
-
-Ask: "Do results truly support the claim?" and "Is there a simpler counter-explanation?" """,
+# Merged dict for backward compat
+STAGE_REVIEW_CRITERIA: dict[str, str] = {
+    **RESEARCH_REVIEW_CRITERIA,
+    **CODE_REVIEW_CRITERIA,
 }
 
 _DEFAULT_CRITERIA = """\

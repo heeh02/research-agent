@@ -54,6 +54,15 @@ ALL_FAILURE_TYPES = FAILURE_TYPE_SAME_STAGE | frozenset(FAILURE_TYPE_CROSS_STAGE
 # Verdict parsing
 # ---------------------------------------------------------------------------
 
+# Verdict values recognized as valid (used to skip template blocks like
+# ``verdict: PASS | REVISE | FAIL`` which yaml.safe_load parses as a string).
+_VALID_VERDICTS = frozenset({
+    "PASS", "ACCEPT",
+    "REVISE", "MINOR_REVISION", "CONDITIONAL_ACCEPT",
+    "FAIL", "REJECT", "MAJOR_REVISION",
+})
+
+
 def parse_verdict(output_text: str, process_success: bool) -> str:
     """Parse verdict from critic output. Returns 'PASS', 'REVISE', or 'FAIL'.
 
@@ -109,7 +118,7 @@ def _normalize_verdict(raw: str) -> str:
     return "REVISE"
 
 
-def _find_verdict_yaml_block(text: str) -> Optional[str]:
+def find_verdict_yaml_block(text: str) -> Optional[str]:
     """Find the YAML block most likely to contain the verdict.
 
     When critic output has multiple YAML blocks (e.g., quoted artifact + verdict),
@@ -117,25 +126,32 @@ def _find_verdict_yaml_block(text: str) -> Optional[str]:
 
     Strategy:
     1. Find ALL yaml blocks via re.findall
-    2. Return the first block that contains a 'verdict' key
-    3. If none contains 'verdict', return the LAST block (most likely the verdict)
+    2. Return the first block that contains a 'verdict' key with a VALID value
+       (skips template blocks like ``verdict: PASS | REVISE | FAIL``)
+    3. If none contains a valid verdict, return the LAST block (most likely verdict)
     4. If no blocks at all, return None
     """
     blocks = re.findall(r"```ya?ml\s*\n(.*?)```", text, re.DOTALL)
     if not blocks:
         return None
 
-    # Prefer the block that has a verdict key
+    # Prefer the block that has a verdict key with a recognizable value
     for block in blocks:
         try:
             data = yaml.safe_load(block)
             if isinstance(data, dict) and "verdict" in data:
-                return block
+                v = str(data["verdict"]).upper().strip()
+                if v in _VALID_VERDICTS:
+                    return block
         except (yaml.YAMLError, ValueError):
             continue
 
-    # No block has verdict — return the last one
+    # No block has a valid verdict — return the last one
     return blocks[-1]
+
+
+# Keep private alias for backward compat (internal callers)
+_find_verdict_yaml_block = find_verdict_yaml_block
 
 
 def parse_scores(output_text: str) -> dict[str, float]:

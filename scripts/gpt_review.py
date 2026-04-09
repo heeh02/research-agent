@@ -36,6 +36,7 @@ from research_agent.models import (
     AgentRole,
     CostRecord,
     LLMProvider,
+    resolve_critic_role,
 )
 from research_agent.state import StateManager
 from research_agent.integrations.llm import LLMClient, estimate_cost
@@ -327,7 +328,7 @@ def save_review(
         stage=stage,
         status=status,
         checks=checks,
-        reviewer=AgentRole.CRITIC,
+        reviewer=resolve_critic_role(stage),
         overall_feedback="\n".join(feedback_parts),
         iteration=iteration,
     )
@@ -335,7 +336,7 @@ def save_review(
 
     # Record cost
     state.cost_records.append(CostRecord(
-        agent=AgentRole.CRITIC,
+        agent=resolve_critic_role(stage),
         provider=LLMProvider.OPENAI,
         model=model,
         input_tokens=0,

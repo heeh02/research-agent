@@ -120,7 +120,7 @@ def cmd_status(args):
     if missing:
         print(f"\n⚠  Missing artifacts for current stage: {', '.join(missing)}")
     else:
-        print(f"\n✓ All required artifacts present. Request Codex review: /codex:adversarial-review  or  python scripts/codex_review.py")
+        print(f"\n✓ All required artifacts present. Run review: python scripts/multi_agent.py review")
 
     # Latest gate feedback
     stage_gates = [g for g in state.gate_results if g.stage == stage]
@@ -232,8 +232,8 @@ def cmd_advance(args):
     # Check gate
     stage_gates = [g for g in state.gate_results if g.stage == stage]
     if not stage_gates and not args.force:
-        print("No gate evaluation found. Run Codex review first:")
-        print(f"  /codex:adversarial-review  or  python scripts/codex_review.py")
+        print("No gate evaluation found. Run review first:")
+        print(f"  python scripts/multi_agent.py review")
         sys.exit(1)
 
     if stage_gates:

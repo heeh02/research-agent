@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .models import AgentRole, Stage
+from .models import AgentRole, Stage, is_critic_role
 
 
 @dataclass
@@ -174,8 +174,8 @@ def _allowed_write_patterns(role: AgentRole, stage: Stage, project_id: str = "")
         return [stage_art]
     elif role == AgentRole.ENGINEER:
         return [stage_art, f"{proj}experiments/"]
-    elif role == AgentRole.CRITIC:
-        # Critic should write NOTHING — all output is stdout
+    elif is_critic_role(role):
+        # Critics should write NOTHING — all output is stdout
         # We still allow review_*.yaml in the stage dir (dispatcher writes these)
         return [f"{proj}artifacts/{stage.value}/review_"]
     elif role == AgentRole.ORCHESTRATOR:

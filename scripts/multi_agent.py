@@ -19,6 +19,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import sys
 import uuid
 from datetime import datetime
@@ -44,6 +45,8 @@ from research_agent.models import (
     LLMProvider,
     Stage,
     VersionEventType,
+    resolve_critic_role,
+    is_critic_role,
 )
 from research_agent.state import StateManager
 from research_agent.artifacts import create_artifact, register_artifact_file, load_schema, validate_artifact_content, safe_parse_yaml
@@ -210,7 +213,8 @@ def run_step(sm, dispatcher, project_id, instruction="", force_stage=None, auto_
     # Backend capability warnings
     backend = dispatcher.backends.get(role)
     if backend:
-        warnings = verify_backend_capabilities(backend, role, stage)
+        toolset = dispatcher._get_toolset(role)
+        warnings = verify_backend_capabilities(backend, role, stage, allowed_tools=toolset)
         for w in warnings:
             print(f"  ⚠ {w}")
 
@@ -408,13 +412,17 @@ def run_orchestrator_validation(sm, project_id, stage, base_dir, log_fn=print):
 
 
 def run_review(sm, dispatcher, project_id, auto_mode=False):
-    """Run Codex review. Records version event."""
+    """Run critic review (research_critic or code_critic based on stage)."""
     state = sm.load_project(project_id)
     stage = state.current_stage
     ver = state.current_version()
+    critic_role = resolve_critic_role(stage)
 
-    from research_agent.agents.critic import STAGE_REVIEW_CRITERIA
-    criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+    from research_agent.agents.critic import RESEARCH_REVIEW_CRITERIA, CODE_REVIEW_CRITERIA
+    if critic_role == AgentRole.RESEARCH_CRITIC:
+        criteria = RESEARCH_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+    else:
+        criteria = CODE_REVIEW_CRITERIA.get(stage.value, "Review for implementation quality.")
 
     # Build stage-specific score keys from stages.yaml
     config = load_config()
@@ -449,32 +457,40 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
             f"The test_result and metrics artifacts have been VERIFIED by the Orchestrator "
             f"through actual code execution. Review the ACTUAL results, not agent claims.\n"
         )
-    task = build_task_card(state, stage, AgentRole.CRITIC, project_id, review_instr)
+    task = build_task_card(state, stage, critic_role, project_id, review_instr)
 
-    critic_backend = dispatcher.backends.get(AgentRole.CRITIC, "codex")
-    critic_model = dispatcher.models.get(AgentRole.CRITIC, "gpt-5.4")
-    print(f"┌─ v{ver} Critic ({critic_backend.value}/{critic_model})")
+    critic_backend = dispatcher.backends.get(critic_role, CLIBackend.CODEX)
+    critic_model = dispatcher.models.get(critic_role, "gpt-5.4")
+    critic_label = "Research Critic" if critic_role == AgentRole.RESEARCH_CRITIC else "Code Critic"
+
+    # Backend capability warnings for critic role
+    critic_tools = dispatcher._get_toolset(critic_role)
+    critic_warnings = verify_backend_capabilities(critic_backend, critic_role, stage, allowed_tools=critic_tools)
+    for w in critic_warnings:
+        print(f"  ⚠ {w}")
+
+    print(f"┌─ v{ver} {critic_label} ({critic_backend.value}/{critic_model})")
     print(f"└─ Reviewing {stage.value}...")
     print()
 
     result = dispatcher.dispatch(task)
 
-    # Handle auth/network errors from Codex
+    # Handle auth/network errors
     if result.is_auth_error or (not result.success and not result.output_text.strip()):
         retry_str = f" (retried {result.retries}x)" if result.retries else ""
-        print(f"  ✗ Codex review failed{retry_str}: {result.error or 'no output'}")
-        print(f"  ✗ Check: codex login  or network connection")
+        print(f"  ✗ {critic_label} review failed{retry_str}: {result.error or 'no output'}")
+        print(f"  ✗ Check CLI login / network connection")
         state = sm.load_project(project_id)
         state.record_event(VersionEventType.GATE_FAILED,
-            f"Codex unavailable — review skipped{retry_str}",
-            agent=AgentRole.CRITIC, detail=result.output_text[:500])
+            f"{critic_label} unavailable — review skipped{retry_str}",
+            agent=critic_role, detail=result.output_text[:500])
         gate_result = GateResult(
-            gate_name=f"{stage.value}_codex_review", stage=stage,
+            gate_name=f"{stage.value}_critic_review", stage=stage,
             status=GateStatus.FAILED,
-            checks=[GateCheck(name="codex_error", description="Codex unreachable",
-                check_type="codex", passed=False, feedback=f"Network/auth error{retry_str}")],
-            reviewer=AgentRole.CRITIC,
-            overall_feedback=f"Codex review failed (network/auth). Re-run when connection is restored.",
+            checks=[GateCheck(name="critic_error", description=f"{critic_label} unreachable",
+                check_type="critic", passed=False, feedback=f"Network/auth error{retry_str}")],
+            reviewer=critic_role,
+            overall_feedback=f"{critic_label} review failed (network/auth). Re-run when connection is restored.",
             iteration=state.iteration_count.get(stage.value, 1),
         )
         state.gate_results.append(gate_result)
@@ -506,15 +522,16 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
         print(f"  Weighted score {gv.weighted_avg:.2f} < {threshold} — overriding PASS → REVISE")
 
     gate_result = GateResult(
-        gate_name=f"{stage.value}_codex_review",
+        gate_name=f"{stage.value}_critic_review",
         stage=stage,
         status=GateStatus.PASSED if verdict == "PASS" else GateStatus.FAILED,
         checks=[GateCheck(
-            name="codex_review", description="Codex adversarial review (gpt-5.4 xhigh)",
-            check_type="codex", passed=verdict == "PASS",
+            name="critic_review",
+            description=f"{critic_label} ({critic_backend.value}/{critic_model})",
+            check_type="critic", passed=verdict == "PASS",
             feedback=result.output_text,
         )],
-        reviewer=AgentRole.CRITIC,
+        reviewer=critic_role,
         overall_feedback=result.output_text,
         iteration=state.iteration_count.get(stage.value, 1),
     )
@@ -523,19 +540,19 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     state.gate_results.append(gate_result)
     # Record review cost
     if result.cost_usd > 0:
-        backend_enum = dispatcher.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
+        backend_enum = dispatcher.backends.get(critic_role, CLIBackend.CODEX)
         provider_map = {
             CLIBackend.CLAUDE: LLMProvider.CLAUDE,
             CLIBackend.CODEX: LLMProvider.CODEX,
             CLIBackend.OPENCODE: LLMProvider.OPENCODE,
         }
-        cost_desc = f"critic/{stage.value}"
+        cost_desc = f"{critic_role.value}/{stage.value}"
         if result.cost_source == "estimated":
             cost_desc += " (estimated)"
         state.cost_records.append(CostRecord(
-            agent=AgentRole.CRITIC,
+            agent=critic_role,
             provider=provider_map.get(backend_enum, LLMProvider.CLAUDE),
-            model=dispatcher.models.get(AgentRole.CRITIC, "unknown"),
+            model=dispatcher.models.get(critic_role, "unknown"),
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             cost_usd=result.cost_usd,
@@ -545,8 +562,8 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     evt = VersionEventType.GATE_PASSED if verdict == "PASS" else VersionEventType.GATE_FAILED
     state.record_event(
         evt,
-        f"Codex verdict: {verdict}",
-        agent=AgentRole.CRITIC,
+        f"{critic_label} verdict: {verdict}",
+        agent=critic_role,
         gate_verdict=verdict,
         duration_seconds=result.duration_seconds,
         detail=result.output_text,
@@ -554,7 +571,7 @@ def run_review(sm, dispatcher, project_id, auto_mode=False):
     sm.save_project(state)
 
     icon = "✓" if verdict == "PASS" else "✗"
-    print(f"┌─ {icon} v{ver} Codex: {verdict} ({result.duration_seconds:.1f}s)")
+    print(f"┌─ {icon} v{ver} {critic_label}: {verdict} ({result.duration_seconds:.1f}s)")
     print(f"└─")
     print()
     return result, gate_result
@@ -570,6 +587,16 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
     human_gates = [Stage(s) for s in config.get("pipeline", {}).get("human_gates",
                    ["hypothesis_formation", "experimentation"])]
 
+    try:
+      _run_auto_loop(sm, dispatcher, project_id, until_stage, max_revisions, instruction,
+                     config, human_gates)
+    finally:
+        # Always clean up terminal workers on exit (auth error, human gate, --until, etc.)
+        dispatcher.close_all_sessions()
+
+
+def _run_auto_loop(sm, dispatcher, project_id, until_stage, max_revisions, instruction,
+                   config, human_gates):
     while True:
         state = sm.load_project(project_id)
         stage = state.current_stage
@@ -648,6 +675,7 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
                 state.record_transition(rollback_target, trigger, gate_result=latest,
                                         notes=f"Auto-rollback from {stage.value}")
                 sm.save_project(state)
+                dispatcher.clear_stage_sessions(stage)  # Close workers for rolled-back stage
                 print(f"\n  ↩ Auto-rollback: {stage.value} → {rollback_target.value}")
                 instruction = ""
                 continue  # Re-enter while loop at rolled-back stage
@@ -690,11 +718,12 @@ def run_auto(sm, dispatcher, project_id, until_stage=None, max_revisions=3, inst
             trigger = ALLOWED_TRANSITIONS.get((stage, nxt), "auto_advance")
             state.record_transition(nxt, trigger, gate_result=latest)
             sm.save_project(state)
+            dispatcher.clear_stage_sessions(stage)  # Close terminal workers for completed stage
             print(f"\n>>> v{state.current_version()} Advanced → {nxt.value}\n")
             instruction = ""
         else:
             print(f"\n=== Done! ===")
-            break
+            break  # finally block handles session cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -834,10 +863,14 @@ def show_status(sm, project_id):
         print(f"{icon} v{i}.x {s.value:<23s} agent={role:<12s} artifacts={arts}{gs}")
 
     config = load_config()
-    critic_cfg = config.get("agents", {}).get("critic", {})
-    critic_label = f"{critic_cfg.get('backend', 'codex')}/{critic_cfg.get('model', 'gpt-5.4')}"
+    agent_cfg = config.get("agents", {})
+    rc_cfg = agent_cfg.get("research_critic", {})
+    cc_cfg = agent_cfg.get("code_critic", {})
+    rc_label = f"{rc_cfg.get('backend', 'codex')}/{rc_cfg.get('model', 'gpt-5.4')}"
+    cc_label = f"{cc_cfg.get('backend', 'claude')}/{cc_cfg.get('model', 'claude-sonnet-4-6')}"
     print(f"\n  Version: v{state.current_version()} | Cost: ${state.total_cost():.4f}")
-    print(f"  Events:  {len(state.timeline)} | Critic: {critic_label}")
+    print(f"  Events:  {len(state.timeline)}")
+    print(f"  Research Critic: {rc_label} | Code Critic: {cc_label}")
     print()
 
 
@@ -884,19 +917,25 @@ def main():
         return
 
     project_id = get_active(sm)
-    dispatcher = MultiAgentDispatcher(ROOT, ROOT / "agents", config)
 
+    # Lazy dispatcher — only construct for commands that actually dispatch agents
     if args.command == "status":
         show_status(sm, project_id)
-    elif args.command == "step":
+        return
+    if args.command == "timeline":
+        show_timeline(sm, project_id)
+        return
+
+    dispatcher = MultiAgentDispatcher(ROOT, ROOT / "agents", config)
+    atexit.register(dispatcher.close_all_sessions)
+
+    if args.command == "step":
         run_advance_step(sm, dispatcher, project_id, args.instruction)
     elif args.command == "review":
         run_review(sm, dispatcher, project_id)
     elif args.command == "auto":
         until = Stage(args.until) if args.until else None
         run_auto(sm, dispatcher, project_id, until, args.max_revisions, args.instruction)
-    elif args.command == "timeline":
-        show_timeline(sm, project_id)
 
 
 if __name__ == "__main__":

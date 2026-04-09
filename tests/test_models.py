@@ -55,6 +55,8 @@ class TestAgentRoleEnum:
             AgentRole.ORCHESTRATOR,
             AgentRole.RESEARCHER,
             AgentRole.CRITIC,
+            AgentRole.RESEARCH_CRITIC,
+            AgentRole.CODE_CRITIC,
             AgentRole.ENGINEER,
         }
 

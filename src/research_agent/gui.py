@@ -30,6 +30,7 @@ from .models import (
     ALLOWED_TRANSITIONS, STAGE_ORDER, STAGE_PRIMARY_AGENT, STAGE_REQUIRED_ARTIFACTS,
     AgentRole, ArtifactType, CLIBackend, CostRecord, GateCheck, GateResult, GateStatus,
     LLMProvider, ProjectState, Stage, VersionEventType,
+    resolve_critic_role, is_critic_role,
 )
 from .state import StateManager
 from .verdict import (
@@ -209,9 +210,12 @@ class PipelineRunner:
                 except Exception:
                     pass
             self.log("  Force-killed running agent process.")
-        # Also kill visible terminal process if any
+        # Also kill visible terminal process if any (legacy path)
         if d and hasattr(d, '_terminal_pid_file') and d._terminal_pid_file:
             d._kill_terminal_process(d._terminal_pid_file)
+        # Kill all terminal session workers (new path)
+        if d:
+            d.close_all_sessions()
 
     def _start_thread(self, mode, target, *args):
         self.running = True
@@ -538,28 +542,30 @@ class PipelineRunner:
             + pre_check_section
         )
 
-        task = self._build_task(state, stage, AgentRole.CRITIC, review_instruction)
+        critic_role = resolve_critic_role(stage)
+        task = self._build_task(state, stage, critic_role, review_instruction)
 
-        cb = d.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
-        self.log(f"┌─ v{state.current_version()} Critic ({cb.value}/{d.models.get(AgentRole.CRITIC, '?')})")
+        cb = d.backends.get(critic_role, CLIBackend.CODEX)
+        critic_label = "Research Critic" if critic_role == AgentRole.RESEARCH_CRITIC else "Code Critic"
+        self.log(f"┌─ v{state.current_version()} {critic_label} ({cb.value}/{d.models.get(critic_role, '?')})")
         self.log(f"└─ Reviewing {stage.value}...")
 
         result = d.dispatch(task, progress_fn=self.log)
 
         if result.is_auth_error or (not result.success and not result.output_text.strip()):
-            self.log(f"Critic failed: {result.error or 'no output'}")
+            self.log(f"{critic_label} failed: {result.error or 'no output'}")
             state = self.sm.load_project(pid)
             gr = GateResult(
                 gate_name=f"{stage.value}_review", stage=stage, status=GateStatus.FAILED,
-                checks=[GateCheck(name="error", description="Critic unreachable",
-                                  check_type="codex", passed=False, feedback="Network/auth error")],
-                reviewer=AgentRole.CRITIC,
-                overall_feedback="Critic review failed. Re-run when connection is restored.",
+                checks=[GateCheck(name="error", description=f"{critic_label} unreachable",
+                                  check_type="critic", passed=False, feedback="Network/auth error")],
+                reviewer=critic_role,
+                overall_feedback=f"{critic_label} review failed. Re-run when connection is restored.",
                 iteration=state.iteration_count.get(stage.value, 1),
             )
             state.gate_results.append(gr)
-            state.record_event(VersionEventType.GATE_FAILED, "Critic unavailable",
-                               agent=AgentRole.CRITIC, detail=result.output_text[:500])
+            state.record_event(VersionEventType.GATE_FAILED, f"{critic_label} unavailable",
+                               agent=critic_role, detail=result.output_text[:500])
             self.sm.save_project(state)
             return gr
 
@@ -583,10 +589,10 @@ class PipelineRunner:
         gr = GateResult(
             gate_name=f"{stage.value}_review", stage=stage,
             status=GateStatus.PASSED if verdict == "PASS" else GateStatus.FAILED,
-            checks=[GateCheck(name="review", description="Adversarial review",
-                              check_type="codex", passed=verdict == "PASS",
+            checks=[GateCheck(name="review", description=f"{critic_label} review",
+                              check_type="critic", passed=verdict == "PASS",
                               feedback=result.output_text)],
-            reviewer=AgentRole.CRITIC,
+            reviewer=critic_role,
             overall_feedback=result.output_text,
             iteration=state.iteration_count.get(stage.value, 1),
         )
@@ -594,27 +600,27 @@ class PipelineRunner:
         state = self.sm.load_project(pid)
         state.gate_results.append(gr)
         evt = VersionEventType.GATE_PASSED if verdict == "PASS" else VersionEventType.GATE_FAILED
-        state.record_event(evt, f"Critic: {verdict}", agent=AgentRole.CRITIC,
+        state.record_event(evt, f"{critic_label}: {verdict}", agent=critic_role,
                            gate_verdict=verdict, duration_seconds=result.duration_seconds,
                            detail=result.output_text)
         # Record review cost
         if result.cost_usd > 0:
-            backend_enum = d.backends.get(AgentRole.CRITIC, CLIBackend.CODEX)
+            backend_enum = d.backends.get(critic_role, CLIBackend.CODEX)
             _pmap = {CLIBackend.CLAUDE: LLMProvider.CLAUDE, CLIBackend.CODEX: LLMProvider.CODEX,
                      CLIBackend.OPENCODE: LLMProvider.OPENCODE}
-            cost_desc = f"critic/{stage.value}"
+            cost_desc = f"{critic_role.value}/{stage.value}"
             if result.cost_source == "estimated":
                 cost_desc += " (estimated)"
             state.cost_records.append(CostRecord(
-                agent=AgentRole.CRITIC, provider=_pmap.get(backend_enum, LLMProvider.CLAUDE),
-                model=d.models.get(AgentRole.CRITIC, "unknown"),
+                agent=critic_role, provider=_pmap.get(backend_enum, LLMProvider.CLAUDE),
+                model=d.models.get(critic_role, "unknown"),
                 input_tokens=result.input_tokens, output_tokens=result.output_tokens,
                 cost_usd=result.cost_usd, task_description=cost_desc, stage=stage,
             ))
         self.sm.save_project(state)
 
         icon = "✓" if verdict == "PASS" else "✗"
-        self.log(f"  {icon} Critic: {verdict} ({result.duration_seconds:.1f}s)")
+        self.log(f"  {icon} {critic_label}: {verdict} ({result.duration_seconds:.1f}s)")
         return gr
 
     def _run_step_and_review(self, instruction=""):
@@ -634,6 +640,7 @@ class PipelineRunner:
     def _run_auto(self, until_stage, max_rev, instruction):
         """Full auto mode."""
         pid = self.project_id
+        d = self._get_dispatcher()
         human_gates = [Stage(s) for s in
                        self.config.get("pipeline", {}).get("human_gates",
                        ["hypothesis_formation", "experimentation"])]
@@ -713,6 +720,7 @@ class PipelineRunner:
                         notes=f"Auto-rollback from {stage.value}",
                     )
                     self.sm.save_project(state)
+                    d.clear_stage_sessions(stage)
                     self.log(f"  ↩ Auto-rollback: {stage.value} → {rollback_target.value}")
                     continue  # Re-enter while loop at rolled-back stage
                 self.log(f"Gate not passed for {stage.value}. Paused.")
@@ -770,9 +778,11 @@ class PipelineRunner:
                 trigger = ALLOWED_TRANSITIONS.get((stage, nxt), "auto_advance")
                 state.record_transition(nxt, trigger, gate_result=latest)
                 self.sm.save_project(state)
+                d.clear_stage_sessions(stage)
                 self.log(f">>> v{state.current_version()} Advanced → {nxt.value}")
             else:
                 self.log("Pipeline complete!")
+                d.close_all_sessions()
                 break
 
 
@@ -883,7 +893,7 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .acard{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:10px}
 .acard h4{font-size:12px;margin-bottom:6px;display:flex;align-items:center;gap:5px}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.dot-researcher{background:var(--bl)}.dot-engineer{background:var(--gr)}.dot-critic{background:var(--pu)}.dot-orchestrator{background:var(--or)}
+.dot-researcher{background:var(--bl)}.dot-engineer{background:var(--gr)}.dot-critic{background:var(--pu)}.dot-research_critic{background:var(--pu)}.dot-code_critic{background:var(--pu)}.dot-orchestrator{background:var(--or)}
 .crow{display:flex;align-items:center;gap:6px;margin-bottom:5px}
 .crow label{font-size:11px;color:var(--dim);min-width:50px}
 .crow select{flex:1}
@@ -919,7 +929,7 @@ select:focus,input:focus{border-color:var(--bl);outline:none}
 .ec{background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:12px;margin-bottom:8px}
 .ec-hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px;flex-wrap:wrap;gap:3px}
 .ab{font-size:10px;padding:2px 8px;border-radius:8px;font-weight:600;white-space:nowrap}
-.ab-researcher{background:#1a2744;color:var(--bl)}.ab-critic{background:#2a1a2e;color:var(--pu)}
+.ab-researcher{background:#1a2744;color:var(--bl)}.ab-critic{background:#2a1a2e;color:var(--pu)}.ab-research_critic{background:#2a1a2e;color:var(--pu)}.ab-code_critic{background:#2a1a2e;color:var(--pu)}
 .ab-engineer{background:#1a2e1e;color:var(--gr)}.ab-human{background:#2e2a1a;color:var(--yl)}
 .ev-s{font-size:12px;flex:1;min-width:0}.ev-m{font-size:10px;color:var(--dim);white-space:nowrap}
 .vd{font-weight:600}.vd-PASS{color:var(--gr)}.vd-FAIL{color:var(--rd)}.vd-REVISE{color:var(--yl)}
@@ -1097,7 +1107,7 @@ const OC_MODELS=__OC__,STAGE_NAMES=__STAGE_NAMES__;
 const BACKENDS=['claude','codex','opencode'];
 const MODELS={claude:['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5'],codex:['gpt-5.4','gpt-5.4-mini','gpt-4.1','gpt-4o','o3'],opencode:OC_MODELS};
 const EFFORTS={claude:['max','high','medium','low'],codex:['xhigh','high','medium','low'],opencode:['max','high','medium','low','minimal']};
-const ROLES=['researcher','engineer','critic','orchestrator'];
+const ROLES=['researcher','engineer','research_critic','code_critic','orchestrator'];
 const ICONS={agent_run:'\u25B6',gate_review:'\u25C6',gate_passed:'\u2713',gate_failed:'\u2717',stage_advance:'\u23E9',stage_rollback:'\u21A9',human_approve:'\uD83D\uDC64',human_reject:'\u270B',human_feedback:'\uD83D\uDCAC'};
 const ICOLORS={agent_run:'var(--bl)',gate_passed:'var(--gr)',gate_failed:'var(--rd)',stage_advance:'var(--cy)',stage_rollback:'var(--or)',human_approve:'var(--gr)',human_reject:'var(--rd)',human_feedback:'var(--yl)'};
 

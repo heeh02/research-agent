@@ -49,7 +49,7 @@ _stages:
       required_artifacts:
       - result_report
       - claim_checklist
-      reviewer: critic
+      reviewer: research_critic
     experiment_design:
       description: 'Engineer: 设计完整实验方案，说明每个文件作用与其中函数作用，定义数据集/模型/训练/评估/消融 | Critic: 审查设计完整性、可复现性、baseline公平性'
       gate_criteria:
@@ -79,7 +79,7 @@ _stages:
       primary_agent: engineer
       required_artifacts:
       - experiment_spec
-      reviewer: critic
+      reviewer: code_critic
     experimentation:
       description: 'Engineer: 执行实验并收集结果，Orchestrator独立运行并记录真实metrics | Critic: 基于Orchestrator验证的真实指标审查，检测异常与伪造'
       gate_criteria:
@@ -104,7 +104,7 @@ _stages:
       required_artifacts:
       - run_manifest
       - metrics
-      reviewer: engineer
+      reviewer: code_critic
     hypothesis_formation:
       description: 'Researcher: 基于文献形成可证伪假设，定义kill criteria与最小可行实验 | Critic: 审查假设的创新性、可测试性、量化指标合理性，给出专业分析意见'
       gate_criteria:
@@ -131,7 +131,7 @@ _stages:
       primary_agent: researcher
       required_artifacts:
       - hypothesis_card
-      reviewer: critic
+      reviewer: research_critic
     implementation:
       description: 'Engineer: 实现代码，说明每个文件作用与关键函数职责，Orchestrator落盘并跑pytest验证 | Critic: 基于真实测试结果审查代码正确性、可复现性'
       gate_criteria:
@@ -156,7 +156,7 @@ _stages:
       required_artifacts:
       - code
       - test_result
-      reviewer: critic
+      reviewer: code_critic
     literature_review:
       description: 'Researcher: 阅读文献、总结关键要素与核心结论，识别研究缺口，推荐baseline | Critic: 验证论文真实性(URL)、覆盖度、时效性，结合已有研究方向专业分析'
       gate_criteria:
@@ -181,7 +181,7 @@ _stages:
       required_artifacts:
       - literature_map
       - evidence_table
-      reviewer: critic
+      reviewer: research_critic
     problem_definition:
       description: 'Researcher: 定义研究问题、范围与动机，引用5+已有方法与论文 | Critic: 评审问题定义的清晰度、创新性、可行性，结合已有研究方向分析'
       gate_criteria:
@@ -205,18 +205,23 @@ _stages:
       primary_agent: researcher
       required_artifacts:
       - problem_brief
-      reviewer: critic
+      reviewer: research_critic
 agents:
-  critic:
+  research_critic:
     backend: codex
     effort: xhigh
     model: gpt-5.4
+  code_critic:
+    allowed_tools: Read,Glob,Grep
+    backend: claude
+    effort: high
+    model: claude-sonnet-4-6
   engineer:
     allowed_tools: Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent
     backend: opencode
     effort: high
     max_turns: 40
-    model: volcengine-plan/doubao-seed-2.0-code
+    model: volcengine-plan/doubao-seed-2.0-pro
   orchestrator:
     allowed_tools: Read,Write,Bash,Glob,Grep
     backend: opencode

@@ -35,7 +35,9 @@ STAGE_ORDER: list[Stage] = list(Stage)
 class AgentRole(str, Enum):
     ORCHESTRATOR = "orchestrator"
     RESEARCHER = "researcher"
-    CRITIC = "critic"
+    CRITIC = "critic"                    # Kept for state.json backward compat
+    RESEARCH_CRITIC = "research_critic"  # Scientific rigor reviewer
+    CODE_CRITIC = "code_critic"          # Implementation quality reviewer
     ENGINEER = "engineer"
 
 
@@ -121,14 +123,30 @@ STAGE_PRIMARY_AGENT: dict[Stage, AgentRole] = {
 
 # Which agent reviews at each gate
 STAGE_REVIEWER: dict[Stage, AgentRole] = {
-    Stage.PROBLEM_DEFINITION: AgentRole.CRITIC,
-    Stage.LITERATURE_REVIEW: AgentRole.CRITIC,
-    Stage.HYPOTHESIS_FORMATION: AgentRole.CRITIC,
-    Stage.EXPERIMENT_DESIGN: AgentRole.CRITIC,
-    Stage.IMPLEMENTATION: AgentRole.CRITIC,
-    Stage.EXPERIMENTATION: AgentRole.ENGINEER,
-    Stage.ANALYSIS: AgentRole.CRITIC,
+    Stage.PROBLEM_DEFINITION: AgentRole.RESEARCH_CRITIC,
+    Stage.LITERATURE_REVIEW: AgentRole.RESEARCH_CRITIC,
+    Stage.HYPOTHESIS_FORMATION: AgentRole.RESEARCH_CRITIC,
+    Stage.EXPERIMENT_DESIGN: AgentRole.CODE_CRITIC,
+    Stage.IMPLEMENTATION: AgentRole.CODE_CRITIC,
+    Stage.EXPERIMENTATION: AgentRole.CODE_CRITIC,
+    Stage.ANALYSIS: AgentRole.RESEARCH_CRITIC,
 }
+
+# Stages reviewed by research critic (scientific rigor focus)
+_RESEARCH_CRITIC_STAGES = frozenset({
+    Stage.PROBLEM_DEFINITION, Stage.LITERATURE_REVIEW,
+    Stage.HYPOTHESIS_FORMATION, Stage.ANALYSIS,
+})
+
+
+def resolve_critic_role(stage: Stage) -> AgentRole:
+    """Return the appropriate critic role for a stage."""
+    return AgentRole.RESEARCH_CRITIC if stage in _RESEARCH_CRITIC_STAGES else AgentRole.CODE_CRITIC
+
+
+def is_critic_role(role: AgentRole) -> bool:
+    """Check if a role is any critic variant."""
+    return role in (AgentRole.CRITIC, AgentRole.RESEARCH_CRITIC, AgentRole.CODE_CRITIC)
 
 # Required artifact types for each stage's gate to pass
 STAGE_REQUIRED_ARTIFACTS: dict[Stage, list[ArtifactType]] = {

@@ -16,6 +16,7 @@ Definition      Review          Formation      Design
 └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘
      │              │              │              │              │              │              │
 ┌────▼─────┐   ┌────▼─────┐   ┌────▼─────┐   ┌────▼─────┐   ┌────▼─────┐   ┌────▼─────┐   ┌────▼─────┐
+│ Research │   │ Research │   │ Research │   │  Code    │   │  Code    │   │  Code    │   │ Research │
 │  Critic  │   │  Critic  │   │  Critic  │   │  Critic  │   │  Critic  │   │  Critic  │   │  Critic  │
 └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘
      │              │              │              │              │              │              │
@@ -86,17 +87,28 @@ Here is the end-to-end flow when you run `python scripts/multi_agent.py auto`:
 ```
 Python Orchestrator (scripts/multi_agent.py or gui.py)
 │
-├── [Claude CLI]    →  Researcher Agent  ← agents/researcher/CLAUDE.md
-│   Default: claude -p, Claude Opus 4
+├── [Claude CLI]    →  Researcher Agent       ← agents/researcher/CLAUDE.md
+│   Default: claude -p, Claude Opus 4.6
 │   Tools: Read, Write, Glob, Grep, WebSearch, WebFetch, Agent
 │
-├── [OpenCode CLI]  →  Engineer Agent    ← agents/engineer/CLAUDE.md
-│   Default: opencode run, Doubao Seed 2.0 Code
+├── [OpenCode CLI]  →  Engineer Agent         ← agents/engineer/CLAUDE.md
+│   Default: opencode run, Doubao Seed 2.0 Pro
 │   Tools: Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Agent
 │
-├── [Codex CLI]     →  Critic Agent      ← agents/critic/CLAUDE.md
+├── [Codex CLI]     →  Research Critic        ← agents/research_critic/CLAUDE.md
 │   Default: codex exec, GPT-5.4
-│   Access: Full project sandbox (read-only)
+│   Reviews: problem_definition, literature_review, hypothesis_formation, analysis
+│   Focus: scientific rigor, literature verification, hypothesis falsifiability
+│
+├── [Claude CLI]    →  Code Critic            ← agents/code_critic/CLAUDE.md
+│   Default: claude -p, Claude Sonnet 4.6
+│   Reviews: experiment_design, implementation, experimentation
+│   Focus: code correctness, test coverage, reproducibility, DummyDataset detection
+│
+├── Terminal Session Manager (macOS)
+│   - Persistent Terminal.app tabs per (project, stage, role)
+│   - Worker-loop sidecar protocol for reliable output capture
+│   - Session reuse via --resume (Claude) / --continue (OpenCode)
 │
 ├── Orchestrator Execution (pure Python, no LLM)
 │   - materialize code from YAML to disk
@@ -116,13 +128,13 @@ The pipeline is a finite state machine with 7 ordered stages. Each stage has a p
 
 | # | Stage | Primary | Reviewer | Required Artifacts | Human Gate |
 |---|-------|---------|----------|-------------------|------------|
-| 0 | Problem Definition | Researcher | Critic | `problem_brief` | No |
-| 1 | Literature Review | Researcher | Critic | `literature_map`, `evidence_table` | No |
-| 2 | Hypothesis Formation | Researcher | Critic | `hypothesis_card` | **Yes** |
-| 3 | Experiment Design | Engineer | Critic | `experiment_spec` | No |
-| 4 | Implementation | Engineer | Critic | `code`, `test_result` | No |
-| 5 | Experimentation | Engineer | Engineer | `run_manifest`, `metrics` | **Yes** |
-| 6 | Analysis | Researcher | Critic | `result_report`, `claim_checklist` | No |
+| 0 | Problem Definition | Researcher | Research Critic | `problem_brief` | No |
+| 1 | Literature Review | Researcher | Research Critic | `literature_map`, `evidence_table` | No |
+| 2 | Hypothesis Formation | Researcher | Research Critic | `hypothesis_card` | **Yes** |
+| 3 | Experiment Design | Engineer | Code Critic | `experiment_spec` | No |
+| 4 | Implementation | Engineer | Code Critic | `code`, `test_result` | No |
+| 5 | Experimentation | Engineer | Code Critic | `run_manifest`, `metrics` | **Yes** |
+| 6 | Analysis | Researcher | Research Critic | `result_report`, `claim_checklist` | No |
 
 ### State Transitions
 
@@ -205,14 +217,25 @@ Translates hypotheses into executable experiments.
 - **Draft vs Verified**: Engineer produces *draft* test results. The orchestrator independently materializes code, runs tests, and writes the *verified* artifact that the critic reviews
 - **Produces**: `experiment_spec`, `code`, `test_result`, `run_manifest`, `metrics`
 
-### Critic
+### Research Critic
 
-Adversarial reviewer. Skeptical by default.
+Adversarial scientific reviewer for research stages (problem definition, literature review, hypothesis formation, analysis).
 
-- **Access**: Full project sandbox (read-only)
-- **Constraints**: Cannot write files, cannot create artifacts, cannot run commands
-- **Output**: Structured YAML with verdict (PASS/REVISE/FAIL), per-criterion scores (0.0-1.0), blocking issues, and `failure_type` for rollback routing
-- **Produces**: Review output (stdout only, not written to files)
+- **Default backend**: Codex (GPT-5.4) — provides independence from the researcher's model family
+- **Tools**: Read, Glob, Grep (read-only, enforced)
+- **Focus**: Scientific rigor, literature verification (URL checks), hypothesis falsifiability, evidence grounding, statistical reasoning
+- **Output**: Structured YAML with verdict, per-criterion scores, and `failure_type`
+
+### Code Critic
+
+Adversarial code reviewer for engineering stages (experiment design, implementation, experimentation).
+
+- **Default backend**: Claude (Sonnet 4.6)
+- **Tools**: Read, Glob, Grep (read-only, enforced)
+- **Focus**: Code correctness, DummyDataset detection, test coverage, reproducibility, spec compliance, actual execution output review
+- **Output**: Same structured YAML format as Research Critic
+
+Both critics never resume sessions — each review is independent to prevent anchoring bias from prior iterations.
 
 ### Orchestrator
 
@@ -322,24 +345,28 @@ All configuration lives in `config/settings.yaml`:
 agents:
   researcher:
     backend: claude                           # claude | codex | opencode
-    model: claude-opus-4-20250514
+    model: claude-opus-4-6
     effort: max
     max_turns: 30
     allowed_tools: Read,Write,Glob,Grep,WebSearch,WebFetch,Agent
   engineer:
     backend: opencode
-    model: volcengine-plan/doubao-seed-2.0-code
+    model: volcengine-plan/doubao-seed-2.0-pro
     effort: high
     max_turns: 40
-  critic:
+  research_critic:                            # Reviews research stages
     backend: codex
     model: gpt-5.4
     effort: xhigh
+  code_critic:                                # Reviews engineering stages
+    backend: claude
+    model: claude-sonnet-4-6
+    effort: high
+    allowed_tools: Read,Glob,Grep             # Read-only enforced
 
 pipeline:
   human_gates: [hypothesis_formation, experimentation]
   max_iterations: 5
-  automation_level: hybrid
 
 cost:
   warning_threshold: 5.0
@@ -368,6 +395,7 @@ research-agent/
 │   ├── state.py                # Persistence: atomic write, flock, project CRUD
 │   ├── artifacts.py            # Schema validation, artifact registration, context assembly
 │   ├── dispatcher.py           # Multi-backend dispatch: claude, codex, opencode subprocess mgmt
+│   ├── terminal.py             # Terminal Session Manager: persistent macOS Terminal.app tabs
 │   ├── verdict.py              # Verdict parsing, weighted scoring, rollback routing
 │   ├── gate_eval.py            # Three-layer gate evaluation (composition layer)
 │   ├── prechecks.py            # Domain-specific structural checks per stage
@@ -387,7 +415,9 @@ research-agent/
 ├── agents/                     # Agent role instructions (CLAUDE.md per role)
 │   ├── researcher/CLAUDE.md
 │   ├── engineer/CLAUDE.md
-│   └── critic/CLAUDE.md
+│   ├── research_critic/CLAUDE.md  # Scientific rigor reviewer
+│   ├── code_critic/CLAUDE.md      # Implementation quality reviewer
+│   └── critic/CLAUDE.md           # Legacy (kept for backward compat)
 │
 ├── config/
 │   ├── settings.yaml           # Agent backends, models, pipeline config, cost limits
@@ -541,17 +571,28 @@ Research Agent 是一个多智能体自动化科研系统，通过隔离的 AI a
 ```
 Python Orchestrator（scripts/multi_agent.py 或 gui.py）
 │
-├── [Claude CLI]    →  Researcher Agent  ← agents/researcher/CLAUDE.md
-│   默认：claude -p, Claude Opus 4
+├── [Claude CLI]    →  Researcher Agent       ← agents/researcher/CLAUDE.md
+│   默认：claude -p, Claude Opus 4.6
 │   工具：Read, Write, Glob, Grep, WebSearch, WebFetch, Agent
 │
-├── [OpenCode CLI]  →  Engineer Agent    ← agents/engineer/CLAUDE.md
-│   默认：opencode run, Doubao Seed 2.0 Code
+├── [OpenCode CLI]  →  Engineer Agent         ← agents/engineer/CLAUDE.md
+│   默认：opencode run, Doubao Seed 2.0 Pro
 │   工具：Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Agent
 │
-├── [Codex CLI]     →  Critic Agent      ← agents/critic/CLAUDE.md
+├── [Codex CLI]     →  Research Critic        ← agents/research_critic/CLAUDE.md
 │   默认：codex exec, GPT-5.4
-│   权限：完整项目沙箱（只读）
+│   审查：问题定义、文献综述、假设形成、结果分析
+│   重点：科学严谨性、文献验证、假设可证伪性
+│
+├── [Claude CLI]    →  Code Critic            ← agents/code_critic/CLAUDE.md
+│   默认：claude -p, Claude Sonnet 4.6
+│   审查：实验设计、代码实现、实验执行
+│   重点：代码正确性、测试覆盖、可复现性、DummyDataset 检测
+│
+├── 终端会话管理器（macOS）
+│   - 每 (项目, 阶段, 角色) 一个持久 Terminal.app 标签页
+│   - Worker-loop sidecar 协议确保可靠的输出捕获
+│   - 会话复用：--resume (Claude) / --continue (OpenCode) 节省 token
 │
 ├── Orchestrator 执行（纯 Python，无 LLM 调用）
 │   - 从 YAML 中提取代码落盘
@@ -571,13 +612,13 @@ Pipeline 是一个有 7 个有序阶段的有限状态机。每个阶段有主 a
 
 | # | 阶段 | 主 Agent | 审查者 | 所需产物 | 人类门控 |
 |---|------|---------|--------|---------|---------|
-| 0 | 问题定义 | Researcher | Critic | `problem_brief` | 否 |
-| 1 | 文献综述 | Researcher | Critic | `literature_map`, `evidence_table` | 否 |
-| 2 | 假设形成 | Researcher | Critic | `hypothesis_card` | **是** |
-| 3 | 实验设计 | Engineer | Critic | `experiment_spec` | 否 |
-| 4 | 代码实现 | Engineer | Critic | `code`, `test_result` | 否 |
-| 5 | 实验执行 | Engineer | Engineer | `run_manifest`, `metrics` | **是** |
-| 6 | 结果分析 | Researcher | Critic | `result_report`, `claim_checklist` | 否 |
+| 0 | 问题定义 | Researcher | Research Critic | `problem_brief` | 否 |
+| 1 | 文献综述 | Researcher | Research Critic | `literature_map`, `evidence_table` | 否 |
+| 2 | 假设形成 | Researcher | Research Critic | `hypothesis_card` | **是** |
+| 3 | 实验设计 | Engineer | Code Critic | `experiment_spec` | 否 |
+| 4 | 代码实现 | Engineer | Code Critic | `code`, `test_result` | 否 |
+| 5 | 实验执行 | Engineer | Code Critic | `run_manifest`, `metrics` | **是** |
+| 6 | 结果分析 | Researcher | Research Critic | `result_report`, `claim_checklist` | 否 |
 
 #### 状态转换
 
@@ -647,14 +688,25 @@ Critic agent 对每个阶段按加权标准评分（定义在 `config/stages.yam
 - **草稿 vs 已验证**：Engineer 产出*草稿*测试结果。Orchestrator 独立落盘代码、运行测试，写入 Critic 审查的*已验证*产物
 - **产物**：`experiment_spec`、`code`、`test_result`、`run_manifest`、`metrics`
 
-#### Critic（审稿人）
+#### Research Critic（研究审稿人）
 
-对抗性审查者，默认持怀疑态度。
+对抗性科学审查者，审查研究阶段（问题定义、文献综述、假设形成、结果分析）。
 
-- **权限**：完整项目沙箱（只读）
-- **约束**：不能写文件、不能创建产物、不能运行命令
-- **输出**：结构化 YAML — 裁定（PASS/REVISE/FAIL）、各维度评分（0.0-1.0）、阻塞性问题、用于回退路由的 `failure_type`
-- **产物**：评审输出（仅 stdout，不写入文件）
+- **默认后端**：Codex (GPT-5.4) — 与 Researcher 的模型族独立，提供真正的对抗视角
+- **工具**：Read, Glob, Grep（强制只读）
+- **重点**：科学严谨性、文献真实性验证（URL 检查）、假设可证伪性、证据支撑度、统计推理
+- **输出**：结构化 YAML — 裁定、评分、`failure_type`
+
+#### Code Critic（代码审稿人）
+
+对抗性代码审查者，审查工程阶段（实验设计、代码实现、实验执行）。
+
+- **默认后端**：Claude (Sonnet 4.6)
+- **工具**：Read, Glob, Grep（强制只读）
+- **重点**：代码正确性、DummyDataset 检测、测试覆盖率、可复现性、spec 合规性、实际执行输出审查
+- **输出**：与 Research Critic 相同的结构化 YAML 格式
+
+两种 Critic 都不复用会话 — 每次评审独立进行，防止前次迭代产生的锚定偏差。
 
 #### Orchestrator（编排器）
 
@@ -758,18 +810,23 @@ GUI 功能：
 agents:
   researcher:
     backend: claude                           # claude | codex | opencode
-    model: claude-opus-4-20250514
+    model: claude-opus-4-6
     effort: max
     max_turns: 30
   engineer:
     backend: opencode
-    model: volcengine-plan/doubao-seed-2.0-code
+    model: volcengine-plan/doubao-seed-2.0-pro
     effort: high
     max_turns: 40
-  critic:
+  research_critic:                            # 审查研究阶段
     backend: codex
     model: gpt-5.4
     effort: xhigh
+  code_critic:                                # 审查工程阶段
+    backend: claude
+    model: claude-sonnet-4-6
+    effort: high
+    allowed_tools: Read,Glob,Grep             # 强制只读
 
 pipeline:
   human_gates: [hypothesis_formation, experimentation]

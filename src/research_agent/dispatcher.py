@@ -29,7 +29,7 @@ import yaml
 
 from .models import (
     AgentRole, ArtifactType, CLIBackend, CostRecord, LLMProvider,
-    ProjectState, Stage, STAGE_REQUIRED_ARTIFACTS,
+    ProjectState, Stage, STAGE_REQUIRED_ARTIFACTS, is_critic_role,
 )
 from .sandbox import (
     FileSnapshot,
@@ -37,6 +37,7 @@ from .sandbox import (
     check_violations,
     snapshot_directory,
 )
+from .terminal import TerminalSessionManager
 
 
 # ---------------------------------------------------------------------------
@@ -184,18 +185,48 @@ class MultiAgentDispatcher:
             if raw:
                 self.backends[role] = CLIBackend(raw)
             else:
-                # Default: critic→codex, others→claude
-                self.backends[role] = CLIBackend.CODEX if role == AgentRole.CRITIC else CLIBackend.CLAUDE
+                # Default: critics→codex, others→claude
+                if role in (AgentRole.CRITIC, AgentRole.RESEARCH_CRITIC, AgentRole.CODE_CRITIC):
+                    self.backends[role] = CLIBackend.CODEX
+                else:
+                    self.backends[role] = CLIBackend.CLAUDE
+
+        # Model/effort per role. Legacy configs may have `agents.critic` with a model
+        # that doesn't match the new split backends — only inherit from legacy if the
+        # backend is compatible (e.g., don't pass a Claude model ID to codex exec).
+        def _critic_model(role_key: str, default: str) -> str:
+            cfg = agent_cfg.get(role_key, {})
+            if cfg.get("model"):
+                return cfg["model"]
+            # Legacy fallback: only use old `critic` model if backends match
+            legacy = agent_cfg.get("critic", {})
+            if legacy.get("model"):
+                legacy_backend = legacy.get("backend", "codex")
+                this_backend = self.backends.get(AgentRole(role_key), CLIBackend.CODEX).value
+                if legacy_backend == this_backend:
+                    return legacy["model"]
+            return default
+
+        def _critic_effort(role_key: str, default: str) -> str:
+            cfg = agent_cfg.get(role_key, {})
+            if cfg.get("effort"):
+                return cfg["effort"]
+            legacy = agent_cfg.get("critic", {})
+            return legacy.get("effort", default)
 
         self.models: dict[AgentRole, str] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ENGINEER]),
-            AgentRole.CRITIC: agent_cfg.get("critic", {}).get("model", "gpt-5.4"),
+            AgentRole.CRITIC: _critic_model("research_critic", "gpt-5.4"),
+            AgentRole.RESEARCH_CRITIC: _critic_model("research_critic", "gpt-5.4"),
+            AgentRole.CODE_CRITIC: _critic_model("code_critic", "claude-sonnet-4-6"),
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("model", DEFAULT_AGENT_MODELS[AgentRole.ORCHESTRATOR]),
         }
         self.effort: dict[AgentRole, str] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ENGINEER]),
+            AgentRole.RESEARCH_CRITIC: _critic_effort("research_critic", "xhigh"),
+            AgentRole.CODE_CRITIC: _critic_effort("code_critic", "high"),
             AgentRole.ORCHESTRATOR: agent_cfg.get("orchestrator", {}).get("effort", DEFAULT_AGENT_EFFORT[AgentRole.ORCHESTRATOR]),
         }
         self._active_proc = None  # Track running subprocess for force-kill
@@ -205,6 +236,14 @@ class MultiAgentDispatcher:
             self.config.get("gui", {}).get("visible_terminal", True)
             and platform.system() == "Darwin"
         )
+        # Terminal session manager for persistent worker tabs
+        # Use system temp dir (NOT project_dir) to avoid false sandbox violations
+        if self.visible_terminal:
+            self._terminal_mgr = TerminalSessionManager(
+                base_dir=Path(tempfile.gettempdir()) / "ra-terminal-sessions",
+            )
+        else:
+            self._terminal_mgr = None
         self.max_turns: dict[AgentRole, int] = {
             AgentRole.RESEARCHER: agent_cfg.get("researcher", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.RESEARCHER]),
             AgentRole.ENGINEER: agent_cfg.get("engineer", {}).get("max_turns", DEFAULT_MAX_TURNS[AgentRole.ENGINEER]),
@@ -224,16 +263,13 @@ class MultiAgentDispatcher:
         if backend == CLIBackend.CODEX:
             return self._dispatch_codex_with_retry(task)
 
-        # Claude and OpenCode share the same retry loop
-        prompt = self._build_prompt(task)
-        toolset = self._get_toolset(role)
-        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-6"))
-        effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
+        # Extract project_id early — needed by session lookup and snapshot
+        pid = task.metadata.get("project_id", "")
 
-        # Critic doesn't produce files — it outputs verdict in stdout
-        is_critic = (role == AgentRole.CRITIC)
+        # Critics don't produce files — strip required_outputs BEFORE building prompt
+        # so _build_prompt won't emit "You MUST produce these files" for critics
+        is_critic = is_critic_role(role)
         if is_critic:
-            # Don't wait for file creation; critic output is in the text
             task = TaskCard(
                 task_id=task.task_id, role=task.role, stage=task.stage,
                 instruction=task.instruction, context_files=task.context_files,
@@ -242,8 +278,21 @@ class MultiAgentDispatcher:
                 constraints=task.constraints, metadata=task.metadata,
             )
 
-        # Snapshot project dir before dispatch (for violation detection)
-        pid = task.metadata.get("project_id", "")
+        # Check if this is a session resume (same project+stage+role dispatched before)
+        # Only resume if the worker is actually alive — dead workers lose session context
+        # Never resume for critics — they must review independently each time
+        is_resume = False
+        if self._terminal_mgr and not is_critic:
+            session_key = (pid, task.stage.value, task.role.value)
+            existing = self._terminal_mgr._sessions.get(session_key)
+            if existing and existing.session_id and self._terminal_mgr.is_alive(existing):
+                is_resume = True
+            elif existing and existing.session_id and not self._terminal_mgr.is_alive(existing):
+                existing.session_id = ""
+        prompt = self._build_prompt(task, is_resume=is_resume)
+        toolset = self._get_toolset(role)
+        model = self.models.get(role, DEFAULT_AGENT_MODELS.get(role, "claude-sonnet-4-6"))
+        effort = self.effort.get(role, DEFAULT_AGENT_EFFORT.get(role, "high"))
         snap_before: FileSnapshot | None = None
         if pid:
             snap_before = snapshot_directory(self.project_dir, pid)
@@ -263,6 +312,8 @@ class MultiAgentDispatcher:
                         expected_files=task.required_outputs,
                         progress_fn=progress_fn,
                         cancel_event=cancel_event,
+                        stage=task.stage, role=task.role,
+                        project_id=pid,
                     )
                     # OpenCode has no usage data — estimate from text length
                     cost_usd, in_tokens, out_tokens = self._estimate_cost_from_text(
@@ -270,7 +321,9 @@ class MultiAgentDispatcher:
                     cost_source = "estimated"
                 else:
                     output, exit_code, cost_usd, in_tokens, out_tokens = self._run_claude(
-                        prompt, toolset, model, effort)
+                        prompt, toolset, model, effort,
+                        stage=task.stage, role=task.role,
+                        project_id=pid)
                     cost_source = "claude_cli" if cost_usd > 0 else "unknown"
             except subprocess.TimeoutExpired:
                 output = f"ERROR: {backend.value} process timed out"
@@ -330,6 +383,16 @@ class MultiAgentDispatcher:
             output_text="All retries exhausted", error="Max retries exceeded",
             retries=self.max_retries, is_auth_error=True,
         )
+
+    def clear_stage_sessions(self, stage: Stage):
+        """Close all terminal workers for a stage (called on advance/rollback)."""
+        if self._terminal_mgr:
+            self._terminal_mgr.close_stage(stage)
+
+    def close_all_sessions(self):
+        """Close all terminal workers (pipeline shutdown)."""
+        if self._terminal_mgr:
+            self._terminal_mgr.close_all()
 
     def dispatch_parallel(self, tasks: list[TaskCard]) -> list[AgentResult]:
         import concurrent.futures
@@ -402,13 +465,20 @@ class MultiAgentDispatcher:
     # Internal — Claude Code CLI
     # -----------------------------------------------------------------------
 
-    def _build_prompt(self, task: TaskCard) -> str:
+    def _build_prompt(self, task: TaskCard, is_resume: bool = False) -> str:
+        """Build the prompt for an agent dispatch.
+
+        When is_resume=True (session continuation within the same stage),
+        skip role instructions and context files — they're already in the
+        session. Only include new feedback and required outputs.
+        """
         parts: list[str] = []
 
-        role_instructions = self._load_role_instructions(task.role)
-        if role_instructions:
-            parts.append(role_instructions)
-            parts.append("")
+        if not is_resume:
+            role_instructions = self._load_role_instructions(task.role)
+            if role_instructions:
+                parts.append(role_instructions)
+                parts.append("")
 
         parts.append("## Task Card")
         parts.append(f"Task ID: {task.task_id}")
@@ -429,7 +499,8 @@ class MultiAgentDispatcher:
                 parts.append(f"- {f}")
             parts.append("")
 
-        if task.context_files:
+        if not is_resume and task.context_files:
+            # Skip context files on resume — they're already in the session
             parts.append("## Context Files")
             parts.append("Read these files for context before starting:")
             for f in task.context_files:
@@ -459,6 +530,9 @@ class MultiAgentDispatcher:
         role_cfg = agent_cfg.get(role.value, {})
         if "allowed_tools" in role_cfg:
             return role_cfg["allowed_tools"]
+        # Critics are read-only — never fall back to engineer toolset
+        if is_critic_role(role):
+            return "Read,Glob,Grep"
         return {
             AgentRole.RESEARCHER: AgentToolset.RESEARCHER.value,
             AgentRole.ENGINEER: AgentToolset.ENGINEER.value,
@@ -626,7 +700,11 @@ echo ""
     # -----------------------------------------------------------------------
 
     def _run_claude(self, prompt: str, allowed_tools: str, model: str,
-                    effort: str = "high") -> tuple[str, int, float, int, int]:
+                    effort: str = "high",
+                    stage: Stage | None = None,
+                    role: AgentRole | None = None,
+                    project_id: str = "",
+                    ) -> tuple[str, int, float, int, int]:
         """Run Claude Code CLI. Returns (output, exit_code, cost_usd, in_tokens, out_tokens)."""
         cmd = [
             "claude", "-p",
@@ -638,46 +716,58 @@ echo ""
         timeout = 900 if effort == "max" else 600
         print(f"  $ {' '.join(cmd)} <<< (prompt {len(prompt)} chars, timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode ---
-        # Two-phase approach:
-        #   Phase 1: `claude -p` runs the task (reliable prompt + JSON capture)
-        #   Phase 2: `claude --resume <session_id>` opens interactive TUI
-        #            so the user can watch the conversation and continue
-        if self.visible_terminal:
+        # --- Visible Terminal mode (persistent worker tab) ---
+        if self.visible_terminal and self._terminal_mgr and stage and role:
             if len(prompt.encode("utf-8")) > 200_000:
                 print("  ⚠ Prompt too large for visible terminal mode, falling back to piped mode")
             else:
-                run_dir = tempfile.mkdtemp(prefix="ra-claude-")
-                prompt_path = os.path.join(run_dir, "prompt.txt")
-                output_path = os.path.join(run_dir, "output.txt")
-                with open(prompt_path, "w", encoding="utf-8") as f:
-                    f.write(prompt)
+                session = self._terminal_mgr.get_or_create(
+                    stage, role,
+                    title=f"{role.value}@{stage.value} — Claude ({model})",
+                    cwd=str(self.project_dir),
+                    project_id=project_id,
+                )
+                # Use $RA_WDIR/$RA_ITER (set by worker at runtime) instead of
+                # hardcoded paths — safe even if send_command relaunches with a new dir
+                prompt_ref = '"$RA_WDIR/prompt_${RA_ITER}.txt"'
+                output_ref = '"$RA_WDIR/output_${RA_ITER}.json"'
+                sid_ref = '"$RA_WDIR/session_id.txt"'
 
-                # Phase 1: claude -p executes the task, captures JSON
-                # Phase 2: claude --resume opens interactive TUI for observation
-                shell_body = (
-                    f"cat {shlex.quote(prompt_path)}"
-                    f" | claude -p"
+                # Session resume: only for non-critics with existing session_id
+                resume_flag = ""
+                if session.session_id and not is_critic_role(role):
+                    resume_flag = f" --resume {shlex.quote(session.session_id)}"
+                    print(f"  [Session] Resuming session {session.session_id[:12]}...", flush=True)
+
+                command_script = (
+                    f"cat {prompt_ref}"
+                    f" | claude -p{resume_flag}"
                     f" --output-format json"
                     f" --model {shlex.quote(model)}"
                     f" --effort {shlex.quote(effort)}"
                     f" --allowedTools {shlex.quote(allowed_tools)}"
-                    f" > {shlex.quote(output_path)} 2>&1"
+                    f" > {output_ref} 2>&1"
+                    f"\nCLAUDE_RC=$?"
                     f"\n"
-                    f'\nSESSION_ID=$(python3 -c "import json,sys;d=json.load(open(\'{output_path}\'));print(d.get(\'session_id\',\'\'))" 2>/dev/null)'
-                    f"\nif [ -n \"$SESSION_ID\" ]; then"
+                    f"\n# Extract session_id for future resume"
+                    f'\npython3 -c "import json;d=json.load(open({output_ref}));print(d.get(\'session_id\',\'\'))" > {sid_ref} 2>/dev/null'
+                    f"\n"
+                    f"\n# Signal completion to Python dispatcher BEFORE any interactive step"
+                    f'\necho "$CLAUDE_RC" > "$RA_EXIT"'
+                    f'\ntouch "$RA_DONE"'
+                    f"\n"
+                    f"\n# Print session_id for manual observation (non-blocking)"
+                    f'\nSID=$(cat {sid_ref} 2>/dev/null)'
+                    f'\nif [ -n "$SID" ]; then'
                     f"\n  echo ''"
-                    f"\n  echo '  Task complete. Opening interactive session...'"
+                    f"\n  echo '  Task complete. Session: '\"$SID\""
+                    f"\n  echo '  To interact: claude --resume '\"$SID\""
                     f"\n  echo ''"
-                    f"\n  claude --resume \"$SESSION_ID\" --model {shlex.quote(model)} --effort {shlex.quote(effort)}"
                     f"\nfi"
                 )
-                output, exit_code = self._open_terminal(
-                    title=f"Claude Code — {model} ({effort})",
-                    shell_body=shell_body,
-                    run_dir=run_dir,
-                    cwd=str(self.project_dir),
-                    timeout=timeout,
+
+                output, exit_code = self._terminal_mgr.send_command(
+                    session, command_script, prompt=prompt, timeout=timeout,
                 )
                 # Parse JSON from captured output for real cost data
                 if output.strip():
@@ -732,6 +822,9 @@ echo ""
                       expected_files: list[str] | None = None,
                       progress_fn=None,
                       cancel_event=None,
+                      stage: Stage | None = None,
+                      role: AgentRole | None = None,
+                      project_id: str = "",
                       ) -> tuple[str, int]:
         """Run opencode run with a prompt. Returns (output, exit_code).
 
@@ -741,6 +834,7 @@ echo ""
         cmd = [
             OPENCODE_BIN, "run",
             "--dir", str(self.project_dir),
+            "--thinking",
         ]
         if model:
             cmd.extend(["-m", model])
@@ -759,33 +853,81 @@ echo ""
         cmd_display = cmd[:-1] + [f"'({len(prompt)} chars)'"]
         print(f"  $ {' '.join(cmd_display)}  (timeout {timeout}s)", flush=True)
 
-        # --- Visible Terminal mode: opencode in Terminal.app ---
-        if self.visible_terminal:
-            run_dir = tempfile.mkdtemp(prefix="ra-opencode-")
-            prompt_path = os.path.join(run_dir, "prompt.txt")
-            output_path = os.path.join(run_dir, "output.txt")
-            with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write(prompt)
+        # --- Visible Terminal mode (persistent worker tab) ---
+        if self.visible_terminal and self._terminal_mgr and stage and role:
+            session = self._terminal_mgr.get_or_create(
+                stage, role,
+                title=f"{role.value}@{stage.value} — OpenCode ({model})",
+                cwd=str(self.project_dir),
+                project_id=project_id,
+            )
+            # Use $RA_WDIR/$RA_ITER for safe recovery if worker relaunches
+            prompt_ref = '"$RA_WDIR/prompt_${RA_ITER}.txt"'
+            output_ref = '"$RA_WDIR/output_${RA_ITER}.txt"'
 
-            # Build opencode command; prompt read from file into variable
             oc_args = f"run --dir {shlex.quote(str(self.project_dir))}"
             if model:
                 oc_args += f" -m {shlex.quote(model)}"
             if effort and effort != "none":
                 oc_args += f" --variant {shlex.quote(effort)}"
+            # Show thinking blocks for real-time visibility in Terminal
+            oc_args += " --thinking"
+            # Session resume: use --continue for non-critic subsequent dispatches
+            if not is_critic_role(role) and (session.session_id or session.iteration > 0):
+                oc_args += " --continue"
+                print(f"  [Session] Continuing OpenCode session...", flush=True)
 
-            shell_body = (
-                f'_P="$(cat {shlex.quote(prompt_path)})"\n'
+            # OpenCode may not exit after task completion (keeps server running).
+            # Run it in background, poll for expected files or process exit,
+            # then signal completion and kill the process.
+            # OpenCode may not exit after task completion (keeps server running).
+            # Use `tee` so output is visible in Terminal AND captured to file.
+            # Run in background, poll for expected files / verdict / timeout.
+            expected_str = " ".join(shlex.quote(str(self.project_dir / f)) for f in (expected_files or []))
+            command_script = (
+                f'_P="$(cat {prompt_ref})"\n'
                 f"{shlex.quote(OPENCODE_BIN)} {oc_args}"
-                f' "$_P" 2>&1 | tee {shlex.quote(output_path)}'
+                f' "$_P" 2>&1 | tee {output_ref} &\n'
+                f'PIPE_PID=$!\n'
+                f'EXPECTED_FILES=({expected_str})\n'
+                f'ELAPSED=0\n'
+                f'while kill -0 $PIPE_PID 2>/dev/null; do\n'
+                f'  sleep 5\n'
+                f'  ELAPSED=$((ELAPSED + 5))\n'
+                # Check if expected files appeared
+                f'  if [ ${{#EXPECTED_FILES[@]}} -gt 0 ]; then\n'
+                f'    ALL_FOUND=true\n'
+                f'    for ef in "${{EXPECTED_FILES[@]}}"; do\n'
+                f'      [ ! -f "$ef" ] && ALL_FOUND=false && break\n'
+                f'    done\n'
+                f'    if $ALL_FOUND; then\n'
+                f'      echo ""\n'
+                f'      echo "  Output files detected (${{ELAPSED}}s)"\n'
+                f'      sleep 3\n'
+                f'      break\n'
+                f'    fi\n'
+                f'  else\n'
+                # No expected files (critic mode): check output for verdict
+                f'    if [ -f {output_ref} ] && grep -qi "verdict:" {output_ref} 2>/dev/null; then\n'
+                f'      echo ""\n'
+                f'      echo "  Verdict detected in output (${{ELAPSED}}s)"\n'
+                f'      ALL_FOUND=true\n'
+                f'      sleep 2\n'
+                f'      break\n'
+                f'    fi\n'
+                f'  fi\n'
+                f'  [ $ELAPSED -ge {timeout} ] && echo "  Timeout (${{ELAPSED}}s)" && break\n'
+                f'done\n'
+                # Kill pipeline (tee + opencode via SIGPIPE)
+                f'kill $PIPE_PID 2>/dev/null; wait $PIPE_PID 2>/dev/null\n'
+                f'OC_RC=$?\n'
+                f'[ -n "$ALL_FOUND" ] && [ "$ALL_FOUND" = "true" ] && OC_RC=0\n'
+                f'\n# Signal completion\n'
+                f'echo "$OC_RC" > "$RA_EXIT"\n'
+                f'touch "$RA_DONE"'
             )
-            output, exit_code = self._open_terminal(
-                title=f"OpenCode — {model} ({effort})",
-                shell_body=shell_body,
-                run_dir=run_dir,
-                cwd=str(self.project_dir),
-                timeout=timeout,
-                cancel_event=cancel_event,
+            output, exit_code = self._terminal_mgr.send_command(
+                session, command_script, prompt=prompt, timeout=timeout,
             )
             if not output.strip() and expected_files:
                 found = [(self.project_dir / f).exists() for f in expected_files]
@@ -920,13 +1062,13 @@ echo ""
                     time.sleep(wait)
                     continue
                 return AgentResult(
-                    task_id=task.task_id, role=AgentRole.CRITIC,
+                    task_id=task.task_id, role=task.role,
                     success=False, output_text=f"Codex failed: {e}",
                     error=str(e), retries=attempt,
                 )
 
         return AgentResult(
-            task_id=task.task_id, role=AgentRole.CRITIC,
+            task_id=task.task_id, role=task.role,
             success=False, output_text="Codex: all retries exhausted",
             retries=self.max_retries,
         )
@@ -943,39 +1085,59 @@ echo ""
                 context_parts.append(self._yaml_to_readable(p.name, raw))
 
         criteria = STAGE_REVIEW_CRITERIA.get(task.stage.value, "Review for rigor.")
-        codex_model = self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4")
-        codex_effort = self.config.get("agents", {}).get("critic", {}).get("effort", "xhigh")
+        # Use the task's actual role (research_critic or code_critic) to look up config
+        role_key = task.role.value
+        agent_cfg = self.config.get("agents", {})
+        critic_cfg = agent_cfg.get(role_key, agent_cfg.get("critic", {}))
+        codex_model = self.models.get(task.role, critic_cfg.get("model", "gpt-5.4"))
+        codex_effort = self.effort.get(task.role, critic_cfg.get("effort", "xhigh"))
 
         start = time.time()
 
-        # --- Visible Terminal mode: codex in Terminal.app ---
-        if self.visible_terminal:
-            run_dir = tempfile.mkdtemp(prefix="ra-codex-")
+        # --- Visible Terminal mode (persistent worker tab) ---
+        if self.visible_terminal and self._terminal_mgr:
             review_prompt = build_review_prompt(
                 task.stage.value, "\n\n".join(context_parts), criteria, task.instruction)
-            prompt_path = os.path.join(run_dir, "prompt.txt")
-            output_path = os.path.join(run_dir, "output.txt")
-            with open(prompt_path, "w", encoding="utf-8") as f:
-                f.write(review_prompt)
 
-            # Codex has no TUI — use exec with tee for real-time visibility
+            codex_project_id = task.metadata.get("project_id", "")
+            session = self._terminal_mgr.get_or_create(
+                task.stage, task.role,
+                title=f"{task.role.value}@{task.stage.value} — Codex ({codex_model})",
+                cwd=str(self.project_dir),
+                project_id=codex_project_id,
+            )
+            # Use $RA_WDIR/$RA_ITER for safe recovery if worker relaunches
+            prompt_ref = '"$RA_WDIR/prompt_${RA_ITER}.txt"'
+            output_ref = '"$RA_WDIR/output_${RA_ITER}.txt"'
+
+            # Critics always use fresh sessions — no resume, preserving adversarial independence
             codex_cmd = "codex exec"
             if codex_model:
                 codex_cmd += f" --model {shlex.quote(codex_model)}"
             if codex_effort and codex_effort != "none":
                 codex_cmd += f" -c 'reasoning_effort=\"{codex_effort}\"'"
+            # Use -o to capture only the last assistant message (avoids prompt echo)
+            codex_cmd += f" -o {output_ref}"
 
-            shell_body = (
-                f'_P="$(cat {shlex.quote(prompt_path)})"\n'
-                f'{codex_cmd} "$_P" 2>&1 | tee {shlex.quote(output_path)}'
+            command_script = (
+                f'_P="$(cat {prompt_ref})"\n'
+                f'{codex_cmd} "$_P" 2>&1\n'
+                f'CODEX_RC=$?\n'
+                f'\n# Signal completion\n'
+                f'echo "$CODEX_RC" > "$RA_EXIT"\n'
+                f'touch "$RA_DONE"'
             )
-            raw_output, exit_code = self._open_terminal(
-                title=f"Codex Critic — {codex_model} ({codex_effort})",
-                shell_body=shell_body,
-                run_dir=run_dir,
-                cwd=str(self.project_dir),
-                timeout=900,
+            raw_output, exit_code = self._terminal_mgr.send_command(
+                session, command_script, prompt=review_prompt, timeout=900,
             )
+            # Prefer output from -o file (clean, no prompt echo)
+            # Use session.worker_dir (may differ from pre-send wd if worker relaunched)
+            o_path = session.worker_dir / f"output_{session.iteration}.txt"
+            if o_path.exists():
+                try:
+                    raw_output = o_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
             result = parse_codex_review(raw_output)
             result.exit_code = exit_code
         else:
@@ -1012,13 +1174,12 @@ echo ""
         self._save_full_log(task, result.raw_output)
 
         # Codex CLI does not expose token usage — estimate from text
-        codex_model = self.config.get("agents", {}).get("critic", {}).get("model", "gpt-5.4")
         prompt_text = task.instruction + "\n".join(context_parts)
         est_cost, est_in, est_out = self._estimate_cost_from_text(
             prompt_text, result.raw_output, codex_model)
 
         return AgentResult(
-            task_id=task.task_id, role=AgentRole.CRITIC,
+            task_id=task.task_id, role=task.role,
             success=result.verdict == "PASS",
             output_text=result.raw_output,
             output_files=[str(review_path)],

@@ -37,9 +37,10 @@ from research_agent.models import (
     GateStatus,
     LLMProvider,
     Stage,
+    resolve_critic_role,
 )
 from research_agent.state import StateManager
-from research_agent.agents.critic import CriticAgent, STAGE_REVIEW_CRITERIA
+from research_agent.agents.critic import CriticAgent, STAGE_REVIEW_CRITERIA, RESEARCH_REVIEW_CRITERIA, CODE_REVIEW_CRITERIA
 from research_agent.integrations.codex import (
     check_codex_available,
     codex_review,
@@ -146,7 +147,7 @@ def save_review_to_state(
         stage=stage,
         status=status,
         checks=checks,
-        reviewer=AgentRole.CRITIC,
+        reviewer=resolve_critic_role(stage),
         overall_feedback="\n".join(feedback_parts),
         iteration=iteration,
     )
@@ -154,7 +155,7 @@ def save_review_to_state(
 
     # Record cost (approximate — Codex uses ChatGPT subscription)
     state.cost_records.append(CostRecord(
-        agent=AgentRole.CRITIC,
+        agent=resolve_critic_role(stage),
         provider=LLMProvider.CODEX,
         model=model,
         input_tokens=0,
@@ -203,8 +204,28 @@ def main():
     state = sm.load_project(project_id)
     stage = Stage(args.stage) if args.stage else state.current_stage
 
+    # Use configured critic model/effort if not overridden via CLI.
+    # This script always runs via Codex CLI, so only inherit config when
+    # the configured backend is also Codex (avoid passing Claude model IDs).
+    config_file = base_dir / "config" / "settings.yaml"
+    if config_file.exists():
+        config = yaml.safe_load(config_file.read_text()) or {}
+    else:
+        config = {}
+    critic_role = resolve_critic_role(stage)
+    agent_cfg = config.get("agents", {})
+    critic_cfg = agent_cfg.get(critic_role.value, agent_cfg.get("critic", {}))
+    cfg_backend = critic_cfg.get("backend", "codex")
+    if cfg_backend == "codex":
+        # Safe to inherit model/effort from config (both are Codex-compatible)
+        if args.model == "gpt-5.4":
+            args.model = critic_cfg.get("model", "gpt-5.4")
+        if args.effort == "xhigh":
+            args.effort = critic_cfg.get("effort", "xhigh")
+
+    critic_label = "Research Critic" if critic_role == AgentRole.RESEARCH_CRITIC else "Code Critic"
     print(f"╔══════════════════════════════════════════════╗")
-    print(f"║  Codex Critic Review (codex-plugin-cc)       ║")
+    print(f"║  {critic_label + ' Review':<43s} ║")
     print(f"║  Project: {state.name[:34]:<34s} ║")
     print(f"║  Stage:   {stage.value:<34s} ║")
     print(f"║  Model:   {args.model:<34s} ║")
@@ -258,7 +279,10 @@ def main():
         print("⚠  Very little content to review. Make sure artifacts exist.")
 
     # Run Codex review
-    criteria = STAGE_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+    if critic_role == AgentRole.RESEARCH_CRITIC:
+        criteria = RESEARCH_REVIEW_CRITERIA.get(stage.value, "Review for scientific rigor.")
+    else:
+        criteria = CODE_REVIEW_CRITERIA.get(stage.value, "Review for implementation quality.")
     project_context = (
         f"Project: {state.name}\n"
         f"Research Question: {state.research_question}"

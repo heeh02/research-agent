@@ -199,14 +199,25 @@ class TestVerifyBackendCapabilities:
         # Claude researcher should not have WebSearch warning
         assert not any("WebSearch" in w for w in warnings)
 
-    def test_critic_non_codex_warning(self):
+    def test_critic_with_write_tools_warns(self):
+        """Critic with write-capable tools should warn, regardless of backend."""
         warnings = verify_backend_capabilities(
             CLIBackend.CLAUDE, AgentRole.CRITIC, Stage.PROBLEM_DEFINITION,
+            allowed_tools="Read,Write,Edit,Bash",
         )
-        assert any("write files" in w.lower() for w in warnings)
+        assert any("write-capable" in w.lower() for w in warnings)
 
-    def test_critic_codex_ok(self):
+    def test_critic_read_only_tools_ok(self):
+        """Critic with read-only tools on Claude is fine — no warning."""
         warnings = verify_backend_capabilities(
-            CLIBackend.CODEX, AgentRole.CRITIC, Stage.PROBLEM_DEFINITION,
+            CLIBackend.CLAUDE, AgentRole.RESEARCH_CRITIC, Stage.PROBLEM_DEFINITION,
+            allowed_tools="Read,Glob,Grep",
         )
-        assert not any("write files" in w.lower() for w in warnings)
+        assert not any("write" in w.lower() for w in warnings)
+
+    def test_critic_no_tools_specified_ok(self):
+        """Critic with no allowed_tools (empty) — no false positive."""
+        warnings = verify_backend_capabilities(
+            CLIBackend.CODEX, AgentRole.CODE_CRITIC, Stage.IMPLEMENTATION,
+        )
+        assert not any("write" in w.lower() for w in warnings)

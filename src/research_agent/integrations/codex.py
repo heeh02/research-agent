@@ -139,51 +139,76 @@ verdict, failure_type (required if REVISE/FAIL: one of structural_issue, impleme
 
 
 def parse_codex_review(raw_output: str) -> CodexReviewResult:
-    """Parse Codex output into a structured CodexReviewResult."""
+    """Parse Codex output into a structured CodexReviewResult.
+
+    Uses re.findall (all YAML blocks) with valid-verdict filtering to avoid
+    picking up template or quoted-artifact blocks from the echoed prompt.
+    """
     result = CodexReviewResult(verdict="REVISE", raw_output=raw_output)
 
-    # Try to extract YAML block
-    yaml_match = re.search(r"```ya?ml\s*\n(.*?)```", raw_output, re.DOTALL)
-    if yaml_match:
-        try:
-            data = yaml.safe_load(yaml_match.group(1))
-            if isinstance(data, dict):
-                raw_verdict = str(data.get("verdict", "REVISE")).upper()
-                # Normalize non-standard verdicts
-                if raw_verdict in ("REJECT", "MAJOR_REVISION"):
-                    raw_verdict = "FAIL"
-                elif raw_verdict in ("MINOR_REVISION", "CONDITIONAL_ACCEPT"):
-                    raw_verdict = "REVISE"
-                elif raw_verdict in ("ACCEPT",):
-                    raw_verdict = "PASS"
-                result.verdict = raw_verdict
+    # Valid single-word verdict values (skips templates like "PASS | REVISE | FAIL")
+    _VALID = {"PASS", "ACCEPT", "REVISE", "MINOR_REVISION", "CONDITIONAL_ACCEPT",
+              "FAIL", "REJECT", "MAJOR_REVISION"}
 
-                # Handle nested score dicts like {score: 0.8, justification: "..."}
-                raw_scores = data.get("scores", {})
-                result.scores = {}
-                for k, v in raw_scores.items():
-                    if isinstance(v, (int, float)):
-                        result.scores[k] = float(v)
-                    elif isinstance(v, dict) and "score" in v:
-                        result.scores[k] = float(v["score"])
-                result.blocking_issues = [
-                    str(i) for i in data.get("blocking_issues", [])
-                ]
-                result.suggestions = [
-                    str(i) for i in data.get("suggestions", [])
-                ]
-                result.strongest_objection = str(
-                    data.get("strongest_objection", "")
-                )
-                result.what_would_make_it_pass = str(
-                    data.get("what_would_make_it_pass", "")
-                )
-                result.failure_type = str(
-                    data.get("failure_type", "")
-                )
-                return result
+    # Find ALL YAML blocks and pick the first one with a valid verdict
+    blocks = re.findall(r"```ya?ml\s*\n(.*?)```", raw_output, re.DOTALL)
+    data = None
+    for block in blocks:
+        try:
+            parsed = yaml.safe_load(block)
+            if isinstance(parsed, dict) and "verdict" in parsed:
+                v = str(parsed["verdict"]).upper().strip()
+                if v in _VALID:
+                    data = parsed
+                    break
+        except (yaml.YAMLError, ValueError):
+            continue
+
+    # Fallback: try the last block even if it has no verdict key
+    if data is None and blocks:
+        try:
+            parsed = yaml.safe_load(blocks[-1])
+            if isinstance(parsed, dict):
+                data = parsed
         except (yaml.YAMLError, ValueError):
             pass
+
+    if data is not None:
+        raw_verdict = str(data.get("verdict", "REVISE")).upper().strip()
+        # Normalize non-standard verdicts
+        if raw_verdict in ("REJECT", "MAJOR_REVISION"):
+            raw_verdict = "FAIL"
+        elif raw_verdict in ("MINOR_REVISION", "CONDITIONAL_ACCEPT"):
+            raw_verdict = "REVISE"
+        elif raw_verdict in ("ACCEPT",):
+            raw_verdict = "PASS"
+        result.verdict = raw_verdict
+
+        # Handle nested score dicts like {score: 0.8, justification: "..."}
+        raw_scores = data.get("scores", {})
+        if isinstance(raw_scores, dict):
+            result.scores = {}
+            for k, v in raw_scores.items():
+                if isinstance(v, (int, float)):
+                    result.scores[k] = float(v)
+                elif isinstance(v, dict) and "score" in v:
+                    result.scores[k] = float(v["score"])
+        result.blocking_issues = [
+            str(i) for i in data.get("blocking_issues", [])
+        ]
+        result.suggestions = [
+            str(i) for i in data.get("suggestions", [])
+        ]
+        result.strongest_objection = str(
+            data.get("strongest_objection", "")
+        )
+        result.what_would_make_it_pass = str(
+            data.get("what_would_make_it_pass", "")
+        )
+        result.failure_type = str(
+            data.get("failure_type", "")
+        )
+        return result
 
     # Fallback: detect verdict from text
     upper = raw_output.upper()
